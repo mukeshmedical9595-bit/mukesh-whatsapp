@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Mukesh Medical — WhatsApp</title>
+<style>
+  :root{--g:#128C7E;--gd:#075E54;--bg:#f0f2f5;--in:#fff;--out:#d9fdd3}
+  *{box-sizing:border-box;font-family:system-ui,Segoe UI,Roboto,sans-serif}
+  body{margin:0;background:var(--bg);color:#111}
+  header{background:var(--gd);color:#fff;padding:12px 18px;display:flex;align-items:center;justify-content:space-between}
+  header h1{font-size:18px;margin:0}
+  .pill{font-size:12px;padding:4px 10px;border-radius:20px;background:#ffffff22}
+  .pill.ok{background:#25D36622}
+  .wrap{display:flex;height:calc(100vh - 52px)}
+  .list{width:320px;border-right:1px solid #ddd;overflow-y:auto;background:#fff}
+  .conv{padding:12px 16px;border-bottom:1px solid #eee;cursor:pointer}
+  .conv:hover{background:#f7f7f7}
+  .conv.active{background:#eafaf1}
+  .conv .n{font-weight:600}
+  .conv .p{font-size:13px;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .chat{flex:1;display:flex;flex-direction:column}
+  .msgs{flex:1;overflow-y:auto;padding:18px;background:#e5ddd5}
+  .b{max-width:70%;padding:8px 12px;border-radius:8px;margin:6px 0;white-space:pre-wrap;word-wrap:break-word;box-shadow:0 1px 1px #0001}
+  .b.in{background:var(--in)}
+  .b.out{background:var(--out);margin-left:auto}
+  .b .t{font-size:10px;color:#888;margin-top:3px;text-align:right}
+  .composer{display:flex;padding:12px;background:#f0f2f5;border-top:1px solid #ddd;gap:8px}
+  .composer input{flex:1;padding:10px 14px;border:1px solid #ccc;border-radius:20px;font-size:14px}
+  .composer button,.connect button{background:var(--g);color:#fff;border:0;border-radius:20px;padding:10px 18px;cursor:pointer;font-size:14px}
+  .empty{margin:auto;text-align:center;color:#777;padding:40px}
+  .connect{padding:40px;text-align:center}
+  .connect h2{margin:0 0 8px}
+  .connect p{color:#555;max-width:520px;margin:8px auto 20px}
+  .note{font-size:12px;color:#888;margin-top:14px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Mukesh Medical · WhatsApp</h1>
+  <span id="status" class="pill">checking…</span>
+</header>
+
+<div id="app"></div>
+
+<script>
+let CFG=null, active=null, cache={};
+
+async function boot(){
+  CFG = await (await fetch('/config')).json();
+  document.getElementById('status').textContent = CFG.connected ? 'Connected' : 'Not connected';
+  document.getElementById('status').className = 'pill' + (CFG.connected?' ok':'');
+  if(!CFG.connected){ renderConnect(); } else { renderInbox(); refresh(); setInterval(refresh, 5000); }
+}
+
+function renderConnect(){
+  document.getElementById('app').innerHTML = `
+    <div class="wrap"><div class="connect" style="margin:auto">
+      <h2>Connect your WhatsApp number (Coexistence)</h2>
+      <p>This links <b>Mukesh Medical</b>'s WhatsApp Business app number to the Cloud API <b>without disconnecting the app</b>.
+      You'll scan a QR code from the WhatsApp Business app on your phone and can sync up to 6 months of chats.</p>
+      <div class="connect"><button onclick="launchSignup()">Connect via Coexistence</button></div>
+      <p class="note">Make sure the WhatsApp Business app on the phone is updated (v2.24.17+) before scanning.</p>
+    </div></div>`;
+}
+
+function renderInbox(){
+  document.getElementById('app').innerHTML = `
+    <div class="wrap">
+      <div class="list" id="list"></div>
+      <div class="chat" id="chat"><div class="empty">Select a conversation</div></div>
+    </div>`;
+}
+
+async function refresh(){
+  const d = await (await fetch('/api/messages')).json();
+  cache = {}; const list = document.getElementById('list'); if(!list) return;
+  list.innerHTML = d.conversations.map(c=>{
+    cache[c.waId]=c; const last=c.messages[c.messages.length-1];
+    return `<div class="conv ${active===c.waId?'active':''}" onclick="open_('${c.waId}')">
+      <div class="n">${esc(c.name)}</div><div class="p">${esc(last?last.text:'')}</div></div>`;
+  }).join('') || '<div class="empty">No messages yet</div>';
+  if(active) renderChat(active);
+}
+
+function open_(id){ active=id; document.querySelectorAll('.conv').forEach(e=>e.classList.remove('active')); renderChat(id); refresh(); }
+
+function renderChat(id){
+  const c=cache[id]; const chat=document.getElementById('chat'); if(!c||!chat) return;
+  chat.innerHTML = `
+    <div class="msgs" id="msgs">${c.messages.map(m=>`
+      <div class="b ${m.dir}">${esc(m.text)}<div class="t">${new Date(m.ts).toLocaleString()} ${m.dir==='out'?(m.status||''):''}</div></div>`).join('')}</div>
+    <div class="composer">
+      <input id="txt" placeholder="Type a reply…" onkeydown="if(event.key==='Enter')send()"/>
+      <button onclick="send()">Send</button>
+    </div>`;
+  const m=document.getElementById('msgs'); m.scrollTop=m.scrollHeight;
+}
+
+async function send(){
+  const t=document.getElementById('txt'); const text=t.value.trim(); if(!text||!active) return; t.value='';
+  const r=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({to:active,text})});
+  if(!r.ok){ alert('Send failed: '+JSON.stringify(await r.json())); }
+  refresh();
+}
+
+function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
+// ---- Meta Embedded Signup (coexistence) ----
+let sessionInfo={};
+window.addEventListener('message',(event)=>{
+  if(!/facebook\.com$/.test(new URL(event.origin).hostname)) return;
+  try{ const data=JSON.parse(event.data);
+    if(data.type==='WA_EMBEDDED_SIGNUP'){ sessionInfo=data.data||{}; console.log('ES event',sessionInfo); }
+  }catch(e){}
+});
+
+function launchSignup(){
+  if(!window.FB){ alert('Facebook SDK still loading, try again in a moment.'); return; }
+  FB.login(function(response){
+    const code = response?.authResponse?.code;
+    if(!code){ alert('Sign-up cancelled or no code returned.'); return; }
+    fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({code, phone_number_id:sessionInfo.phone_number_id, waba_id:sessionInfo.waba_id})})
+      .then(r=>r.json()).then(j=>{
+        if(j.ok){ alert('Connected! Reloading dashboard.'); location.reload(); }
+        else alert('Setup error: '+JSON.stringify(j));
+      });
+  },{
+    config_id: CFG.configId,
+    response_type: 'code',
+    override_default_response_type: true,
+    extras: { setup:{}, featureType:'whatsapp_business_app_onboarding', version:'v3' }
+  });
+}
+
+window.fbAsyncInit=function(){ FB.init({appId:'', version:'v21.0', xfbml:false}); };
+(function(){ fetch('/config').then(r=>r.json()).then(c=>{
+  const s=document.createElement('script'); s.src='https://connect.facebook.net/en_US/sdk.js'; s.async=true;
+  s.onload=()=>FB.init({appId:c.appId, version:c.graphVersion||'v21.0', xfbml:false}); document.body.appendChild(s);
+});})();
+
+boot();
+</script>
+</body>
+</html>
