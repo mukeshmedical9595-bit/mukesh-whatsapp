@@ -117,6 +117,7 @@ window.addEventListener('message',(event)=>{
 
 function launchSignup(){
   if(!window.FB){ alert('Facebook SDK still loading, try again in a moment.'); return; }
+  try{ FB.init({appId:CFG.appId, version:CFG.graphVersion||'v21.0', xfbml:false}); }catch(e){}
   FB.login(function(response){
     const code = response?.authResponse?.code;
     if(!code){ alert('Sign-up cancelled or no code returned.'); return; }
@@ -134,11 +135,11 @@ function launchSignup(){
   });
 }
 
-window.fbAsyncInit=function(){ FB.init({appId:'', version:'v21.0', xfbml:false}); };
 (function(){ fetch('/config').then(r=>r.json()).then(c=>{
-  const s=document.createElement('script'); s.src='https://connect.facebook.net/en_US/sdk.js'; s.async=true;
-  s.onload=()=>FB.init({appId:c.appId, version:c.graphVersion||'v21.0', xfbml:false}); document.body.appendChild(s);
-});})();
+  window.fbAsyncInit=function(){ FB.init({appId:c.appId, version:c.graphVersion||'v21.0', xfbml:false}); };
+  const s=document.createElement('script'); s.async=true; s.defer=true; s.crossOrigin='anonymous';
+  s.src='https://connect.facebook.net/en_US/sdk.js'; document.body.appendChild(s);
+}); })();
 
 boot();
 </script>
