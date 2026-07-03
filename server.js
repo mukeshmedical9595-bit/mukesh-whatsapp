@@ -147,6 +147,24 @@ app.post("/api/session", async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: String(err) }); }
 });
 
+app.get("/privacy", (req, res) => {
+  res.type("html").send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Privacy Policy — Mukesh Medical</title><style>body{font-family:system-ui,Segoe UI,Roboto,sans-serif;max-width:760px;margin:40px auto;padding:0 20px;line-height:1.6;color:#111}h1{color:#075E54}</style></head><body>
+  <h1>Privacy Policy — Mukesh Medical</h1>
+  <p><em>Last updated: ${new Date().toISOString().slice(0,10)}</em></p>
+  <p>Mukesh Medical ("we", "us") operates a WhatsApp-based customer messaging service. This policy explains how we handle information when you message us on WhatsApp.</p>
+  <h2>Information we collect</h2>
+  <p>When you contact us on WhatsApp, we receive your WhatsApp phone number, your WhatsApp profile name, and the content of the messages you send us. We use this solely to respond to your enquiries and provide customer service.</p>
+  <h2>How we use it</h2>
+  <p>We use your information only to communicate with you, answer questions, take orders, and provide support. We do not sell your information.</p>
+  <h2>Sharing</h2>
+  <p>Your messages are processed through Meta's WhatsApp Business Platform in accordance with Meta's terms. We do not share your information with third parties except as required to deliver our service or by law.</p>
+  <h2>Data retention</h2>
+  <p>We retain conversation history only as long as needed to serve you. You may ask us to delete your data at any time by messaging us.</p>
+  <h2>Contact</h2>
+  <p>For any privacy questions or data-deletion requests, message us on WhatsApp at +91 9390327200 or email yashagencies9595@gmail.com.</p>
+  </body></html>`);
+});
+
 app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
 
 app.listen(PORT, () => console.log(`Mukesh Medical WhatsApp app listening on :${PORT}`));
