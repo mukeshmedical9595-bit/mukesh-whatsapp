@@ -165,6 +165,29 @@ app.get("/privacy", (req, res) => {
   </body></html>`);
 });
 
+// ---- Auto-wire: discover phone_number_id + subscribe webhook (coexistence via own WABA) ----
+async function autoWire() {
+  if (!ACCESS_TOKEN || !WABA_ID) return { ok:false, reason:"ACCESS_TOKEN and WABA_ID required" };
+  try {
+    if (!PHONE_NUMBER_ID) {
+      const r = await fetch(`${GRAPH}/${WABA_ID}/phone_numbers?access_token=${encodeURIComponent(ACCESS_TOKEN)}`);
+      const d = await r.json();
+      if (!r.ok) { console.error("phone_numbers err", d); return { ok:false, detail:d }; }
+      const num = (d.data && d.data[0]) || null;
+      if (num) { PHONE_NUMBER_ID = num.id; console.log("Discovered phone_number_id:", PHONE_NUMBER_ID, "(", num.display_phone_number, ")"); }
+    }
+    // Subscribe our app to the WABA so incoming messages hit our webhook
+    const sr = await fetch(`${GRAPH}/${WABA_ID}/subscribed_apps`, {
+      method: "POST", headers: { "Authorization": `Bearer ${ACCESS_TOKEN}` }
+    });
+    console.log("subscribed_apps:", sr.status, await sr.text());
+    store.meta = { phoneNumberId: PHONE_NUMBER_ID, wabaId: WABA_ID, wiredAt: Date.now() };
+    save();
+    return { ok:true, phoneNumberId: PHONE_NUMBER_ID, wabaId: WABA_ID };
+  } catch (e) { console.error("autoWire err", e); return { ok:false, error:String(e) }; }
+}
+app.get("/api/wire", async (req, res) => res.json(await autoWire()));
+
 app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
 
-app.listen(PORT, () => console.log(`Mukesh Medical WhatsApp app listening on :${PORT}`));
+app.listen(PORT, async () => { console.log(`Mukesh Medical WhatsApp app listening on :${PORT}`); const w = await autoWire(); console.log("autoWire:", JSON.stringify(w)); });
