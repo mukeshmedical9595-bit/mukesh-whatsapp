@@ -79,6 +79,16 @@ app.post("/webhook", (req, res) => {
           }, nameFor(m.from));
           console.log(`IN  ${m.from}: ${text}`);
         }
+        // Outbound echoes: replies sent from the WhatsApp Business app on the phone (coexistence)
+        for (const m of (v.message_echoes || v.smb_message_echoes || [])) {
+          const text = m.text?.body || (m.type ? `[${m.type}]` : "[message]");
+          const cust = m.to || m.recipient_id;
+          addMessage(cust, {
+            id: m.id, dir: "out", type: m.type, text,
+            ts: Number(m.timestamp) * 1000 || Date.now(), status: "sent"
+          }, nameFor(cust));
+          console.log(`ECHO(out) ${cust}: ${text}`);
+        }
         for (const s of (v.statuses || [])) {
           const conv = store.conversations[s.recipient_id];
           if (conv) {
