@@ -4,6 +4,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, updateContact, getSetting, setSetting, dbEnabled } from "./db.js";
 import { mukcareReply } from "./ai.js";
+import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, createExec, listExecs, setExecActive, execHandoffMessage } from "./orders.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -92,6 +93,13 @@ async function handleAiReply(waId) {
       now: new Date()
     });
     if (result.error) { console.error("MUKCARE error:", result.error); return; }
+
+    // Save the patient's name (as given by the customer in chat) as the display name.
+    if (result.patientName) {
+      await updateContact(waId, { name: result.patientName });
+      convo.name = result.patientName;
+    }
+
     if (result.reply) {
       if (result.buttons && result.buttons.length) {
         await sendWhatsAppInteractive(waId, result.reply, result.buttons, { bot: true });
@@ -101,7 +109,24 @@ async function handleAiReply(waId) {
       console.log(`MUKCARE -> ${waId}: ${result.reply}${result.buttons?.length ? " [buttons: " + result.buttons.map(b => b.title).join(", ") + "]" : ""}`);
     }
     if (result.suggestBooked) await setContactFlag(waId, "booked", true);
-    // NOTE: result.order will be consumed in Phase 4 to create an Order + Order ID.
+
+    // When the customer confirms the order, record it and send the real Order ID.
+    if (result.order) {
+      try {
+        const order = await createOrder({
+          waId,
+          customerName: convo.name,
+          phone: waId,
+          mode: result.order.mode,
+          items: result.order.items,
+          fulfillment: result.order.fulfillment,
+          address: result.order.location,
+          status: "new"
+        });
+        await sendWhatsAppText(waId, `Your Order ID is ${order.order_code}. Please keep it for reference. 🙏`, { bot: true });
+        console.log(`ORDER created ${order.order_code} for ${waId}`);
+      } catch (oe) { console.error("createOrder err", oe); }
+    }
   } catch (e) { console.error("handleAiReply err", e); }
 }
 
@@ -202,6 +227,70 @@ app.post("/api/settings", requireAuth, async (req, res) => {
   } catch (err) { console.error("settings set err", err); res.status(500).json({ error: String(err) }); }
 });
 
+// ---- Orders ----
+app.get("/api/orders", requireAuth, async (req, res) => {
+  try { res.json({ orders: await listOrders({ limit: 300 }), execs: await listExecs() }); }
+  catch (err) { console.error("orders list err", err); res.status(500).json({ error: String(err) }); }
+});
+
+// Manual order creation (walk-in / phone). Non-WhatsApp customers get details entered here.
+app.post("/api/orders", requireAuth, async (req, res) => {
+  const b = req.body || {};
+  try {
+    const order = await createOrder({
+      waId: b.waId || null,
+      customerName: b.customerName || null,
+      phone: b.phone || null,
+      mode: b.mode || "typed",
+      items: Array.isArray(b.items) ? b.items : [],
+      fulfillment: b.fulfillment || null,
+      address: b.address || null,
+      notes: b.notes || null,
+      status: b.status || "new"
+    });
+    res.json({ ok: true, order });
+  } catch (err) { console.error("order create err", err); res.status(500).json({ error: String(err) }); }
+});
+
+app.post("/api/orders/:id/status", requireAuth, async (req, res) => {
+  try { res.json({ ok: true, order: await updateOrderStatus(req.params.id, req.body?.status) }); }
+  catch (err) { console.error("order status err", err); res.status(400).json({ error: String(err) }); }
+});
+
+app.post("/api/orders/:id/assign", requireAuth, async (req, res) => {
+  try { res.json({ ok: true, order: await assignExec(req.params.id, req.body?.execId || null) }); }
+  catch (err) { console.error("order assign err", err); res.status(500).json({ error: String(err) }); }
+});
+
+// Send the order details to the assigned delivery executive over WhatsApp.
+app.post("/api/orders/:id/notify-exec", requireAuth, async (req, res) => {
+  try {
+    const order = await getOrder(req.params.id);
+    if (!order) return res.status(404).json({ error: "order not found" });
+    if (!order.exec_id) return res.status(400).json({ error: "no exec assigned" });
+    const exec = (await listExecs()).find(e => String(e.id) === String(order.exec_id));
+    if (!exec?.phone) return res.status(400).json({ error: "exec has no phone" });
+    const r = await sendWhatsAppText(exec.phone, execHandoffMessage(order, exec), { bot: false });
+    if (!r.ok) return res.status(r.status || 400).json(r.error || { error: "send failed" });
+    res.json({ ok: true });
+  } catch (err) { console.error("notify-exec err", err); res.status(500).json({ error: String(err) }); }
+});
+
+// ---- Delivery executives ----
+app.get("/api/execs", requireAuth, async (req, res) => {
+  try { res.json({ execs: await listExecs() }); }
+  catch (err) { res.status(500).json({ error: String(err) }); }
+});
+app.post("/api/execs", requireAuth, async (req, res) => {
+  const b = req.body || {};
+  try { res.json({ ok: true, exec: await createExec({ name: b.name, phone: b.phone, area: b.area }) }); }
+  catch (err) { console.error("exec create err", err); res.status(500).json({ error: String(err) }); }
+});
+app.post("/api/execs/:id/active", requireAuth, async (req, res) => {
+  try { res.json({ ok: true, exec: await setExecActive(req.params.id, req.body?.active) }); }
+  catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
 // ---- Send a reply ----
 app.post("/api/send", requireAuth, async (req, res) => {
   const { to, text } = req.body || {};
@@ -268,6 +357,7 @@ app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
 
 (async () => {
   try { await initDb(); } catch (e) { console.error("initDb err", e); }
+  try { await initOrders(); } catch (e) { console.error("initOrders err", e); }
   app.listen(PORT, async () => {
     console.log(`Mukesh Medical app listening on :${PORT} (persistent=${dbEnabled})`);
     console.log("autoWire:", JSON.stringify(await autoWire()));

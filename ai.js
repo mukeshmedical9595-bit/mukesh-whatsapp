@@ -100,6 +100,10 @@ function normalizeResult(parsed) {
   const lang = VALID_LANGS.has(parsed.lang) ? parsed.lang : null;
   const intent = VALID_INTENTS.has(parsed.intent) ? parsed.intent : "other";
   const suggestBooked = Boolean(parsed.suggestBooked);
+  // The patient's name as GIVEN BY THE CUSTOMER in chat (not their WhatsApp
+  // profile name). Set once the customer tells us the name.
+  const patientName = typeof parsed.patientName === "string" && parsed.patientName.trim() !== ""
+    ? parsed.patientName.trim().slice(0, 80) : null;
 
   // Up to 3 tappable WhatsApp reply buttons. Each title is capped at 20 chars
   // (WhatsApp's hard limit). Accept either ["Pickup","Delivery"] or
@@ -131,7 +135,7 @@ function normalizeResult(parsed) {
     }
   }
 
-  return { reply, lang, order, intent, suggestBooked, buttons, error: null };
+  return { reply, lang, order, intent, suggestBooked, patientName, buttons, error: null };
 }
 
 // -----------------------------------------------------------------------------
@@ -173,12 +177,12 @@ Set the "lang" field to "en", "hi", or "te" to describe the LANGUAGE (not the sc
 
 === ORDER FLOW (guide the customer through this, one step at a time, do not dump every question at once) ===
 1. If it's a general enquiry (stock, timing, location, etc.), just help - no need to force the order flow.
-2. If the customer wants to order, first ask for the patient's name (phone number is captured automatically, do not ask for it).
+2. If the customer wants to order, first ask for the patient's name (phone number is captured automatically, do not ask for it). When the customer tells you the name, set the "patientName" field in your JSON to exactly that name.
 3. Ask how they'd like to order: type out the medicines, OR send a photo of the prescription.
 4. If typed: ask them to send each item as "Product name - Quantity" (example: "DOLO 650 - 3 strips"), and record every item they mention into "order.items".
 5. If prescription photo: just acknowledge you've received it and staff will process it. Do not interpret or discuss its contents (see safety rule 2).
 6. Ask whether they want store pickup or home delivery.
-7. If home delivery: ask for their location/area. ${deliveryFeeLine ? `Delivery fee note to share: "${deliveryFeeLine}"` : "You do not know the delivery fee - if asked, say the team will confirm any delivery charge."} (Distance/fee calculation is handled by the app, not you.)
+7. If home delivery: ask for their location/area (address). DO NOT mention any delivery charge, fee, or distance at all - our team handles delivery charges separately after the order. If the customer asks about delivery charges, simply say our team will let them know, and do not quote any amount.
 8. Read the full order back to the customer (items, fulfillment method, location if delivery) and explicitly ask them to confirm.
 9. ONLY when the customer clearly confirms that readback: tell them the order is placed and an Order ID will follow shortly (the app generates the real ID - never invent one), and fill the "order" field in your JSON response for that turn with readbackConfirmed:true. On every other turn, "order" must be null.
 
@@ -212,6 +216,7 @@ Respond with ONLY a single raw JSON object - no markdown code fences, no comment
   },
   "intent": "enquiry" | "order" | "chitchat" | "spam" | "prescription" | "other",
   "suggestBooked": true | false,
+  "patientName": "the patient's name if the customer gave it this turn, else null",
   "buttons": [ { "id": "short_id", "title": "Button text" } ]
 }
 
@@ -283,6 +288,7 @@ export async function mukcareReply({ contact, messages, settings, store, now }) 
     order: null,
     intent: "other",
     suggestBooked: false,
+    patientName: null,
     buttons: [],
     error,
   });

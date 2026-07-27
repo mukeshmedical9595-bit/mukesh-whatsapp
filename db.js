@@ -58,16 +58,19 @@ export async function initDb() {
 export async function upsertContact(waId, name) {
   if (!waId) return;
   if (pool) {
+    // Prefer an existing name (which may be the patient name the customer gave
+    // us, or an agent edit) over the WhatsApp profile name. Only seed from the
+    // incoming profile name when we don't have a name yet.
     await pool.query(
       `INSERT INTO contacts (wa_id, name) VALUES ($1, $2)
        ON CONFLICT (wa_id) DO UPDATE SET
-         name = COALESCE(NULLIF(EXCLUDED.name,''), contacts.name),
+         name = COALESCE(NULLIF(contacts.name,''), NULLIF(EXCLUDED.name,'')),
          updated_at = now()`,
       [waId, name || null]
     );
   } else {
     const c = mem.contacts[waId] || (mem.contacts[waId] = { wa_id: waId, name: waId, booked: false, human_control: false, spam: false, note: null, updated: Date.now(), messages: [] });
-    if (name) c.name = name;
+    if (name && (!c.name || c.name === c.wa_id)) c.name = name; // seed only, don't overwrite a set name
   }
 }
 
