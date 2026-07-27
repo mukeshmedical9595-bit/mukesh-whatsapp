@@ -1,9 +1,8 @@
-// Mukesh Medical - WhatsApp Coexistence + Customer Reply Dashboard
-// Single-file Node/Express server. Works on Render, Railway, Fly, or any Node host.
+// Mukesh Medical - WhatsApp Coexistence dashboard (Postgres-backed).
 import express from "express";
-import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { initDb, addMessage, updateStatus, getConversations, setContactFlag, dbEnabled } from "./db.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -14,87 +13,57 @@ const PORT           = process.env.PORT || 3000;
 const APP_ID         = process.env.APP_ID || "1039310715202655";
 const CONFIG_ID      = process.env.CONFIG_ID || "1403795661596400";
 const GRAPH_VERSION  = process.env.GRAPH_VERSION || "v21.0";
-const APP_SECRET     = process.env.APP_SECRET || "";        // set in host env vars ONLY
+const APP_SECRET     = process.env.APP_SECRET || "";
 const VERIFY_TOKEN   = process.env.VERIFY_TOKEN || "mukeshmedical_verify";
-// These may be provided via env OR captured live from the Embedded Signup flow:
 let ACCESS_TOKEN     = process.env.ACCESS_TOKEN || "";
 let PHONE_NUMBER_ID  = process.env.PHONE_NUMBER_ID || "";
 let WABA_ID          = process.env.WABA_ID || "";
 
 const GRAPH = `https://graph.facebook.com/${GRAPH_VERSION}`;
 
-// ---- Tiny JSON store (conversations keyed by customer wa_id) ----
-const DATA_FILE = path.join(__dirname, "data.json");
-let store = { conversations: {}, meta: {} };
-try { if (fs.existsSync(DATA_FILE)) store = JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); } catch {}
-function save() { try { fs.writeFileSync(DATA_FILE, JSON.stringify(store, null, 2)); } catch (e) { console.error("save err", e); } }
-function addMessage(waId, msg, name) {
-  if (!store.conversations[waId]) store.conversations[waId] = { waId, name: name || waId, messages: [] };
-  if (name) store.conversations[waId].name = name;
-  store.conversations[waId].messages.push(msg);
-  store.conversations[waId].updated = Date.now();
-  save();
-}
-
 // ---- Public config for the frontend (no secrets) ----
 app.get("/config", (req, res) => {
   res.json({
-    appId: APP_ID,
-    configId: CONFIG_ID,
-    graphVersion: GRAPH_VERSION,
+    appId: APP_ID, configId: CONFIG_ID, graphVersion: GRAPH_VERSION,
     connected: Boolean(ACCESS_TOKEN && PHONE_NUMBER_ID),
-    phoneNumberId: PHONE_NUMBER_ID || null,
-    wabaId: WABA_ID || null
+    persistent: dbEnabled,
+    phoneNumberId: PHONE_NUMBER_ID || null, wabaId: WABA_ID || null
   });
 });
 
-// ---- Webhook verification (Meta calls this once) ----
+// ---- Webhook verification ----
 app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+  if (req.query["hub.mode"] === "subscribe" && req.query["hub.verify_token"] === VERIFY_TOKEN) {
     console.log("Webhook verified");
-    return res.status(200).send(challenge);
+    return res.status(200).send(req.query["hub.challenge"]);
   }
   return res.sendStatus(403);
 });
 
-// ---- Webhook receiver (incoming customer messages + statuses) ----
-app.post("/webhook", (req, res) => {
+// ---- Webhook receiver ----
+app.post("/webhook", async (req, res) => {
   res.sendStatus(200); // ack fast
   try {
-    const entry = req.body.entry || [];
-    for (const e of entry) {
+    for (const e of (req.body.entry || [])) {
       for (const ch of (e.changes || [])) {
         const v = ch.value || {};
         const contacts = v.contacts || [];
         const nameFor = (waId) => (contacts.find(c => c.wa_id === waId)?.profile?.name) || waId;
+
         for (const m of (v.messages || [])) {
-          const text = m.text?.body
-            || (m.type ? `[${m.type}]` : "[message]");
-          addMessage(m.from, {
-            id: m.id, dir: "in", type: m.type, text,
-            ts: Number(m.timestamp) * 1000 || Date.now()
-          }, nameFor(m.from));
-          console.log(`IN  ${m.from}: ${text}`);
+          const body = m.text?.body || (m.type ? `[${m.type}]` : "[message]");
+          await addMessage(m.from, { wa_msg_id: m.id, dir: "in", type: m.type, body, ts: Number(m.timestamp) * 1000 || Date.now() }, nameFor(m.from));
+          console.log(`IN  ${m.from}: ${body}`);
         }
-        // Outbound echoes: replies sent from the WhatsApp Business app on the phone (coexistence)
+        // Replies sent from the WhatsApp Business app on the phone (coexistence echoes)
         for (const m of (v.message_echoes || v.smb_message_echoes || [])) {
-          const text = m.text?.body || (m.type ? `[${m.type}]` : "[message]");
+          const body = m.text?.body || (m.type ? `[${m.type}]` : "[message]");
           const cust = m.to || m.recipient_id;
-          addMessage(cust, {
-            id: m.id, dir: "out", type: m.type, text,
-            ts: Number(m.timestamp) * 1000 || Date.now(), status: "sent"
-          }, nameFor(cust));
-          console.log(`ECHO(out) ${cust}: ${text}`);
+          await addMessage(cust, { wa_msg_id: m.id, dir: "out", type: m.type, body, ts: Number(m.timestamp) * 1000 || Date.now(), status: "sent" }, nameFor(cust));
+          console.log(`ECHO ${cust}: ${body}`);
         }
         for (const s of (v.statuses || [])) {
-          const conv = store.conversations[s.recipient_id];
-          if (conv) {
-            const mm = conv.messages.find(x => x.id === s.id);
-            if (mm) { mm.status = s.status; save(); }
-          }
+          await updateStatus(s.id, s.status);
         }
       }
     }
@@ -102,17 +71,25 @@ app.post("/webhook", (req, res) => {
 });
 
 // ---- List conversations ----
-app.get("/api/messages", (req, res) => {
-  const list = Object.values(store.conversations)
-    .sort((a, b) => (b.updated || 0) - (a.updated || 0));
-  res.json({ connected: Boolean(ACCESS_TOKEN && PHONE_NUMBER_ID), conversations: list });
+app.get("/api/messages", async (req, res) => {
+  try {
+    const conversations = await getConversations();
+    res.json({ connected: Boolean(ACCESS_TOKEN && PHONE_NUMBER_ID), persistent: dbEnabled, conversations });
+  } catch (err) { console.error("messages err", err); res.status(500).json({ error: String(err) }); }
+});
+
+// ---- Toggle booked / human_control on a conversation ----
+app.post("/api/contact/:waId/flag", async (req, res) => {
+  const { field, value } = req.body || {};
+  try { await setContactFlag(req.params.waId, field, Boolean(value)); res.json({ ok: true }); }
+  catch (err) { console.error("flag err", err); res.status(500).json({ error: String(err) }); }
 });
 
 // ---- Send a reply ----
 app.post("/api/send", async (req, res) => {
   const { to, text } = req.body || {};
   if (!to || !text) return res.status(400).json({ error: "to and text required" });
-  if (!ACCESS_TOKEN || !PHONE_NUMBER_ID) return res.status(400).json({ error: "Not connected yet. Complete coexistence onboarding first." });
+  if (!ACCESS_TOKEN || !PHONE_NUMBER_ID) return res.status(400).json({ error: "Not connected yet." });
   try {
     const r = await fetch(`${GRAPH}/${PHONE_NUMBER_ID}/messages`, {
       method: "POST",
@@ -121,38 +98,24 @@ app.post("/api/send", async (req, res) => {
     });
     const data = await r.json();
     if (!r.ok) { console.error("send err", data); return res.status(r.status).json(data); }
-    addMessage(to, { id: data.messages?.[0]?.id, dir: "out", type: "text", text, ts: Date.now(), status: "sent" });
+    await addMessage(to, { wa_msg_id: data.messages?.[0]?.id, dir: "out", type: "text", body: text, ts: Date.now(), status: "sent" });
     res.json({ ok: true, data });
   } catch (err) { console.error(err); res.status(500).json({ error: String(err) }); }
 });
 
-// ---- Embedded Signup callback: exchange code -> token, wire up webhook ----
+// ---- Embedded Signup callback (kept for completeness) ----
 app.post("/api/session", async (req, res) => {
   const { code, phone_number_id, waba_id } = req.body || {};
   if (!code) return res.status(400).json({ error: "code required" });
-  if (!APP_SECRET) return res.status(500).json({ error: "APP_SECRET not set on server. Add it to host environment variables." });
+  if (!APP_SECRET) return res.status(500).json({ error: "APP_SECRET not set." });
   try {
-    // 1) Exchange the authorization code for a business access token
-    const tokenUrl = `${GRAPH}/oauth/access_token?client_id=${APP_ID}`
-      + `&client_secret=${encodeURIComponent(APP_SECRET)}&code=${encodeURIComponent(code)}`;
-    const tr = await fetch(tokenUrl);
-    const tdata = await tr.json();
-    if (!tr.ok || !tdata.access_token) { console.error("token err", tdata); return res.status(400).json({ error: "token exchange failed", detail: tdata }); }
+    const tokenUrl = `${GRAPH}/oauth/access_token?client_id=${APP_ID}&client_secret=${encodeURIComponent(APP_SECRET)}&code=${encodeURIComponent(code)}`;
+    const tr = await fetch(tokenUrl); const tdata = await tr.json();
+    if (!tr.ok || !tdata.access_token) return res.status(400).json({ error: "token exchange failed", detail: tdata });
     ACCESS_TOKEN = tdata.access_token;
     if (phone_number_id) PHONE_NUMBER_ID = phone_number_id;
     if (waba_id) WABA_ID = waba_id;
-    store.meta = { phoneNumberId: PHONE_NUMBER_ID, wabaId: WABA_ID, connectedAt: Date.now() };
-    save();
-
-    // 2) Subscribe our app to the WABA so we receive message webhooks
-    if (WABA_ID) {
-      const sr = await fetch(`${GRAPH}/${WABA_ID}/subscribed_apps`, {
-        method: "POST", headers: { "Authorization": `Bearer ${ACCESS_TOKEN}` }
-      });
-      console.log("subscribe_apps:", sr.status, await sr.text());
-    }
-    console.log("=== CONNECTED ===  phone_number_id:", PHONE_NUMBER_ID, " waba_id:", WABA_ID);
-    console.log(">>> Save this ACCESS_TOKEN into your host env vars (ACCESS_TOKEN) to persist across restarts.");
+    if (WABA_ID) await fetch(`${GRAPH}/${WABA_ID}/subscribed_apps`, { method: "POST", headers: { "Authorization": `Bearer ${ACCESS_TOKEN}` } });
     res.json({ ok: true, phoneNumberId: PHONE_NUMBER_ID, wabaId: WABA_ID });
   } catch (err) { console.error(err); res.status(500).json({ error: String(err) }); }
 });
@@ -175,29 +138,30 @@ app.get("/privacy", (req, res) => {
   </body></html>`);
 });
 
-// ---- Auto-wire: discover phone_number_id + subscribe webhook (coexistence via own WABA) ----
+// ---- Auto-wire: discover phone_number_id + subscribe webhook ----
 async function autoWire() {
-  if (!ACCESS_TOKEN || !WABA_ID) return { ok:false, reason:"ACCESS_TOKEN and WABA_ID required" };
+  if (!ACCESS_TOKEN || !WABA_ID) return { ok: false, reason: "ACCESS_TOKEN and WABA_ID required" };
   try {
     if (!PHONE_NUMBER_ID) {
       const r = await fetch(`${GRAPH}/${WABA_ID}/phone_numbers?access_token=${encodeURIComponent(ACCESS_TOKEN)}`);
       const d = await r.json();
-      if (!r.ok) { console.error("phone_numbers err", d); return { ok:false, detail:d }; }
+      if (!r.ok) { console.error("phone_numbers err", d); return { ok: false, detail: d }; }
       const num = (d.data && d.data[0]) || null;
       if (num) { PHONE_NUMBER_ID = num.id; console.log("Discovered phone_number_id:", PHONE_NUMBER_ID, "(", num.display_phone_number, ")"); }
     }
-    // Subscribe our app to the WABA so incoming messages hit our webhook
-    const sr = await fetch(`${GRAPH}/${WABA_ID}/subscribed_apps`, {
-      method: "POST", headers: { "Authorization": `Bearer ${ACCESS_TOKEN}` }
-    });
+    const sr = await fetch(`${GRAPH}/${WABA_ID}/subscribed_apps`, { method: "POST", headers: { "Authorization": `Bearer ${ACCESS_TOKEN}` } });
     console.log("subscribed_apps:", sr.status, await sr.text());
-    store.meta = { phoneNumberId: PHONE_NUMBER_ID, wabaId: WABA_ID, wiredAt: Date.now() };
-    save();
-    return { ok:true, phoneNumberId: PHONE_NUMBER_ID, wabaId: WABA_ID };
-  } catch (e) { console.error("autoWire err", e); return { ok:false, error:String(e) }; }
+    return { ok: true, phoneNumberId: PHONE_NUMBER_ID, wabaId: WABA_ID };
+  } catch (e) { console.error("autoWire err", e); return { ok: false, error: String(e) }; }
 }
 app.get("/api/wire", async (req, res) => res.json(await autoWire()));
 
 app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
 
-app.listen(PORT, async () => { console.log(`Mukesh Medical WhatsApp app listening on :${PORT}`); const w = await autoWire(); console.log("autoWire:", JSON.stringify(w)); });
+(async () => {
+  try { await initDb(); } catch (e) { console.error("initDb err", e); }
+  app.listen(PORT, async () => {
+    console.log(`Mukesh Medical app listening on :${PORT} (persistent=${dbEnabled})`);
+    console.log("autoWire:", JSON.stringify(await autoWire()));
+  });
+})();
