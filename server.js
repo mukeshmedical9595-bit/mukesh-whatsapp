@@ -2,9 +2,11 @@
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
-import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, updateContact, getSetting, setSetting, dbEnabled } from "./db.js";
+import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, updateContact, getSetting, setSetting, saveMedia, getMedia, dbEnabled } from "./db.js";
 import { mukcareReply } from "./ai.js";
 import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, createExec, listExecs, setExecActive, execHandoffMessage } from "./orders.js";
+import { sendTemplate, sendOrderReady, sendOrderDispatched, sendOrderReminder, sendBillSent } from "./templates.js";
+import { initCampaignsDb, sendCampaign, recordOptOut } from "./campaigns.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -74,6 +76,33 @@ async function sendWhatsAppInteractive(to, bodyText, buttons, { bot = false } = 
     await addMessage(to, { wa_msg_id: data.messages?.[0]?.id, dir: "out", type: "interactive", body: stored, ts: Date.now(), status: "sent", bot });
     return { ok: true, data };
   } catch (err) { console.error("sendWhatsAppInteractive err", err); return { ok: false, status: 500, error: { error: String(err) } }; }
+}
+
+// Download a media file (prescription image/document) from WhatsApp by media id.
+async function downloadWhatsAppMedia(mediaId) {
+  if (!ACCESS_TOKEN || !mediaId) return null;
+  try {
+    const metaR = await fetch(`${GRAPH}/${mediaId}?access_token=${encodeURIComponent(ACCESS_TOKEN)}`);
+    const meta = await metaR.json();
+    if (!metaR.ok || !meta.url) { console.error("media meta err", meta); return null; }
+    const binR = await fetch(meta.url, { headers: { "Authorization": `Bearer ${ACCESS_TOKEN}` } });
+    if (!binR.ok) { console.error("media download err", binR.status); return null; }
+    return { buffer: Buffer.from(await binR.arrayBuffer()), mime: meta.mime_type || "application/octet-stream" };
+  } catch (e) { console.error("downloadWhatsAppMedia err", e); return null; }
+}
+
+// Best-effort customer notification when an order status changes (uses approved
+// templates; silently no-ops/logs if the template isn't approved yet in Meta).
+async function notifyOrderStatus(order) {
+  try {
+    const name = order.customer_name || "", code = order.order_code || "";
+    let r = null, label = "";
+    if (order.status === "ready" && order.fulfillment !== "delivery") { r = await sendOrderReady(order.wa_id, { name, orderCode: code }); label = "order-ready"; }
+    else if (order.status === "dispatched") { r = await sendOrderDispatched(order.wa_id, { name, orderCode: code }); label = "dispatched"; }
+    else return;
+    if (r?.ok) await addMessage(order.wa_id, { wa_msg_id: r.id, dir: "out", type: "template", body: `[${label}] Order ${code}`, ts: Date.now(), status: "sent", bot: true });
+    else console.warn("notifyOrderStatus not sent (template maybe pending approval):", r?.error);
+  } catch (e) { console.error("notifyOrderStatus err", e); }
 }
 
 // MUKCARE auto-reply. Called from the webhook for each customer who just messaged.
@@ -167,8 +196,18 @@ app.post("/webhook", async (req, res) => {
         for (const m of (v.messages || [])) {
           // A tapped reply button / list item comes through as an interactive reply.
           const btnTitle = m.interactive?.button_reply?.title || m.interactive?.list_reply?.title;
-          const body = m.text?.body || btnTitle || (m.type ? `[${m.type}]` : "[message]");
-          const { inserted } = await addMessage(m.from, { wa_msg_id: m.id, dir: "in", type: m.type, body, ts: Number(m.timestamp) * 1000 || Date.now() }, nameFor(m.from));
+          let body = m.text?.body || btnTitle || (m.type ? `[${m.type}]` : "[message]");
+          let mediaId = null;
+          // Prescription images (or document uploads) - download & store with us.
+          const mediaObj = m.image || m.document || null;
+          if (mediaObj?.id) {
+            const dl = await downloadWhatsAppMedia(mediaObj.id);
+            if (dl) mediaId = await saveMedia({ waId: m.from, waMsgId: m.id, mime: dl.mime, buffer: dl.buffer });
+            body = m.image ? "[prescription image]" : "[document]";
+          }
+          // Marketing opt-out: a bare "STOP" removes them from future campaigns.
+          if ((m.text?.body || "").trim().toUpperCase() === "STOP") await recordOptOut(m.from);
+          const { inserted } = await addMessage(m.from, { wa_msg_id: m.id, dir: "in", type: m.type, body, media_id: mediaId, ts: Number(m.timestamp) * 1000 || Date.now() }, nameFor(m.from));
           console.log(`IN  ${m.from}: ${body}`);
           if (inserted) aiTargets.add(m.from); // only reply to genuinely new messages
         }
@@ -253,8 +292,11 @@ app.post("/api/orders", requireAuth, async (req, res) => {
 });
 
 app.post("/api/orders/:id/status", requireAuth, async (req, res) => {
-  try { res.json({ ok: true, order: await updateOrderStatus(req.params.id, req.body?.status) }); }
-  catch (err) { console.error("order status err", err); res.status(400).json({ error: String(err) }); }
+  try {
+    const order = await updateOrderStatus(req.params.id, req.body?.status);
+    if (order && order.wa_id) notifyOrderStatus(order).catch(() => {}); // best-effort customer notification
+    res.json({ ok: true, order });
+  } catch (err) { console.error("order status err", err); res.status(400).json({ error: String(err) }); }
 });
 
 app.post("/api/orders/:id/assign", requireAuth, async (req, res) => {
@@ -289,6 +331,42 @@ app.post("/api/execs", requireAuth, async (req, res) => {
 app.post("/api/execs/:id/active", requireAuth, async (req, res) => {
   try { res.json({ ok: true, exec: await setExecActive(req.params.id, req.body?.active) }); }
   catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+// ---- Prescription image / media (auth-gated; health data) ----
+app.get("/media/:id", requireAuth, async (req, res) => {
+  try {
+    const m = await getMedia(req.params.id);
+    if (!m || !m.data) return res.sendStatus(404);
+    res.set("Content-Type", m.mime || "application/octet-stream");
+    res.set("Cache-Control", "private, max-age=86400");
+    res.send(Buffer.isBuffer(m.data) ? m.data : Buffer.from(m.data));
+  } catch (e) { console.error("media err", e); res.sendStatus(500); }
+});
+
+// ---- Bulk broadcast (marketing templates) ----
+app.post("/api/campaigns/send", requireAuth, async (req, res) => {
+  const { name, templateName, langCode, recipients } = req.body || {};
+  try {
+    const summary = await sendCampaign({ name, templateName, langCode: langCode || "en", recipients: recipients || [] });
+    res.json({ ok: true, summary });
+  } catch (err) { console.error("campaign send err", err); res.status(500).json({ error: String(err) }); }
+});
+
+// Manually send an approved template to one customer (e.g. reminder, bill-sent).
+app.post("/api/notify", requireAuth, async (req, res) => {
+  const { to, template, params } = req.body || {};
+  if (!to || !template) return res.status(400).json({ error: "to and template required" });
+  try {
+    let r;
+    if (template === "reminder") r = await sendOrderReminder(to, params || {});
+    else if (template === "bill") r = await sendBillSent(to, params || {});
+    else if (template === "ready") r = await sendOrderReady(to, params || {});
+    else if (template === "dispatched") r = await sendOrderDispatched(to, params || {});
+    else return res.status(400).json({ error: "unknown template" });
+    if (!r.ok) return res.status(400).json({ error: r.error });
+    res.json({ ok: true });
+  } catch (err) { console.error("notify err", err); res.status(500).json({ error: String(err) }); }
 });
 
 // ---- Send a reply ----
@@ -358,6 +436,7 @@ app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
 (async () => {
   try { await initDb(); } catch (e) { console.error("initDb err", e); }
   try { await initOrders(); } catch (e) { console.error("initOrders err", e); }
+  try { await initCampaignsDb(); } catch (e) { console.error("initCampaignsDb err", e); }
   app.listen(PORT, async () => {
     console.log(`Mukesh Medical app listening on :${PORT} (persistent=${dbEnabled})`);
     console.log("autoWire:", JSON.stringify(await autoWire()));

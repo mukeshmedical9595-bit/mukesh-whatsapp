@@ -39,12 +39,23 @@ export async function initDb() {
       body       TEXT,
       status     TEXT,
       bot        BOOLEAN NOT NULL DEFAULT FALSE,
+      media_id   BIGINT,
       ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS bot BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_id BIGINT;
     CREATE INDEX IF NOT EXISTS idx_messages_wa_id ON messages(wa_id);
     CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
+    -- Prescription images / documents sent by customers, stored with us (cloud).
+    CREATE TABLE IF NOT EXISTS media (
+      id         BIGSERIAL PRIMARY KEY,
+      wa_id      TEXT,
+      wa_msg_id  TEXT,
+      mime       TEXT,
+      data       BYTEA,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
     -- simple key/value store for app settings (e.g. Train MUKCARE instructions)
     CREATE TABLE IF NOT EXISTS settings (
       key        TEXT PRIMARY KEY,
@@ -81,18 +92,18 @@ export async function addMessage(waId, msg, name) {
   await upsertContact(waId, name);
   if (pool) {
     const r = await pool.query(
-      `INSERT INTO messages (wa_msg_id, wa_id, dir, type, body, status, bot, ts)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      `INSERT INTO messages (wa_msg_id, wa_id, dir, type, body, status, bot, media_id, ts)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
        ON CONFLICT (wa_msg_id) DO NOTHING`,
       [msg.wa_msg_id || null, waId, msg.dir, msg.type || null, msg.body || "", msg.status || null,
-       Boolean(msg.bot), msg.ts ? new Date(msg.ts) : new Date()]
+       Boolean(msg.bot), msg.media_id || null, msg.ts ? new Date(msg.ts) : new Date()]
     );
     await pool.query(`UPDATE contacts SET updated_at = now() WHERE wa_id = $1`, [waId]);
     return { inserted: r.rowCount > 0 };
   } else {
     const c = mem.contacts[waId];
     if (msg.wa_msg_id && c.messages.some(x => x.id === msg.wa_msg_id)) return { inserted: false };
-    c.messages.push({ id: msg.wa_msg_id, dir: msg.dir, type: msg.type, text: msg.body, ts: msg.ts || Date.now(), status: msg.status, bot: Boolean(msg.bot) });
+    c.messages.push({ id: msg.wa_msg_id, dir: msg.dir, type: msg.type, text: msg.body, ts: msg.ts || Date.now(), status: msg.status, bot: Boolean(msg.bot), mediaId: msg.media_id || null });
     c.updated = Date.now();
     return { inserted: true };
   }
@@ -123,7 +134,7 @@ export async function getConversations() {
     const out = [];
     for (const c of cs) {
       const { rows: ms } = await pool.query(
-        `SELECT wa_msg_id, dir, type, body, status, bot,
+        `SELECT wa_msg_id, dir, type, body, status, bot, media_id,
                 EXTRACT(EPOCH FROM ts)*1000 AS ts
          FROM messages WHERE wa_id = $1 ORDER BY ts ASC`,
         [c.wa_id]
@@ -137,7 +148,7 @@ export async function getConversations() {
         note: c.note || "",
         created: Number(c.created),
         updated: Number(c.updated),
-        messages: ms.map(m => ({ id: m.wa_msg_id, dir: m.dir, type: m.type, text: m.body, ts: Number(m.ts), status: m.status, bot: m.bot }))
+        messages: ms.map(m => ({ id: m.wa_msg_id, dir: m.dir, type: m.type, text: m.body, ts: Number(m.ts), status: m.status, bot: m.bot, mediaId: m.media_id }))
       });
     }
     return out;
@@ -187,19 +198,41 @@ export async function getConversation(waId) {
     if (!cs[0]) return null;
     const c = cs[0];
     const { rows: ms } = await pool.query(
-      `SELECT dir, type, body, status, bot, EXTRACT(EPOCH FROM ts)*1000 AS ts
+      `SELECT dir, type, body, status, bot, media_id, EXTRACT(EPOCH FROM ts)*1000 AS ts
        FROM messages WHERE wa_id = $1 ORDER BY ts ASC`,
       [waId]
     );
     return {
       waId: c.wa_id, name: c.name || c.wa_id,
       booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "",
-      messages: ms.map(m => ({ dir: m.dir, type: m.type, text: m.body, ts: Number(m.ts), status: m.status, bot: m.bot }))
+      messages: ms.map(m => ({ dir: m.dir, type: m.type, text: m.body, ts: Number(m.ts), status: m.status, bot: m.bot, mediaId: m.media_id }))
     };
   }
   const c = mem.contacts[waId];
   if (!c) return null;
   return { waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", messages: c.messages };
+}
+
+// ---- Media (prescription images/documents) ----
+const memMedia = {}; let memMediaSeq = 1;
+export async function saveMedia({ waId, waMsgId, mime, buffer }) {
+  if (pool) {
+    const { rows } = await pool.query(
+      `INSERT INTO media (wa_id, wa_msg_id, mime, data) VALUES ($1,$2,$3,$4) RETURNING id`,
+      [waId || null, waMsgId || null, mime || "application/octet-stream", buffer]
+    );
+    return rows[0].id;
+  }
+  const id = memMediaSeq++;
+  memMedia[id] = { mime: mime || "application/octet-stream", data: buffer };
+  return id;
+}
+export async function getMedia(id) {
+  if (pool) {
+    const { rows } = await pool.query(`SELECT mime, data FROM media WHERE id = $1`, [id]);
+    return rows[0] || null;
+  }
+  return memMedia[id] || null;
 }
 
 // ---- Settings (key/value) ----

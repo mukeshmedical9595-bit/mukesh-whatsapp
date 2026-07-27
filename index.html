@@ -116,6 +116,17 @@
   .linkbtn{background:none;border:0;color:var(--g);cursor:pointer;font-size:13px}
   .modal input,.modal select{padding:9px 11px;border:1px solid var(--bd);border-radius:7px;font-size:14px;font-family:inherit;width:100%}
   .modal .rowf{display:flex;gap:8px;margin-bottom:8px}
+  img.pmedia{max-width:230px;border-radius:6px;margin-top:4px;cursor:pointer;display:block;background:#eee;min-height:36px}
+
+  /* broadcast view */
+  .bcast{padding:22px;max-width:680px;margin:0 auto;overflow:auto;height:100%;width:100%}
+  .bcast h2{margin:0 0 4px;font-size:19px}
+  .bcast .warn{background:#fff4d6;border:1px solid #f0e3b8;color:#8a6100;padding:10px 12px;border-radius:8px;font-size:13px;margin:12px 0}
+  .bcast label{display:block;font-size:12px;color:#667781;margin:12px 0 4px;text-transform:uppercase;letter-spacing:.4px}
+  .bcast textarea{width:100%;min-height:110px;padding:11px;border:1px solid var(--bd);border-radius:8px;font-family:inherit;font-size:14px}
+  .bcast .send{background:var(--g);color:#fff;border:0;border-radius:8px;padding:11px 20px;cursor:pointer;font-size:15px;margin-top:14px}
+  .bcast .send:disabled{opacity:.5;cursor:not-allowed}
+  .ck{display:flex;gap:8px;align-items:flex-start;margin-top:10px;font-size:13px}
 </style>
 </head>
 <body>
@@ -124,6 +135,7 @@
   <div class="nav" id="nav" style="display:none">
     <button class="navbtn active" id="nav-chats" onclick="setView('chats')">💬 Chats</button>
     <button class="navbtn" id="nav-orders" onclick="setView('orders')">📦 Orders</button>
+    <button class="navbtn" id="nav-broadcast" onclick="setView('broadcast')">📣 Broadcast</button>
   </div>
   <div class="r">
     <button class="btn" onclick="openTrain()">🎓 Train MUKCARE</button>
@@ -205,11 +217,10 @@ function startDashboard(){
 
 function setView(v){
   view=v;
-  const nc=document.getElementById('nav-chats'), no=document.getElementById('nav-orders');
-  if(nc) nc.classList.toggle('active', v==='chats');
-  if(no) no.classList.toggle('active', v==='orders');
+  ['chats','orders','broadcast'].forEach(x=>{ const b=document.getElementById('nav-'+x); if(b) b.classList.toggle('active', v===x); });
   if(v==='chats'){ renderInbox(); renderList(); if(active){ renderChat(active); renderProfile(active); } }
-  else { renderOrders(); loadOrders(); }
+  else if(v==='orders'){ renderOrders(); loadOrders(); }
+  else if(v==='broadcast'){ renderBroadcast(); }
 }
 
 function renderLogin(msg){
@@ -313,18 +324,29 @@ function renderChat(id){
     </div>`;
   const m=document.getElementById('msgs'); m.scrollTop=m.scrollHeight;
   const t=document.getElementById('txt'); if(t) t.focus();
+  loadMedia();
 }
 function renderMsgs(c){
   return c.messages.map(m=>{
     const meta=msgMeta(m, c.name);
-    return `<div class="b ${meta.cls}"><div class="who">${esc(meta.who)}</div>${esc(m.text)}<div class="t">${new Date(m.ts).toLocaleString()} ${m.dir==='out'?(m.status||''):''}</div></div>`;
+    const media = m.mediaId ? `<div><img class="pmedia" data-mid="${m.mediaId}" alt="attachment" onclick="openMedia(${m.mediaId})"/></div>` : '';
+    return `<div class="b ${meta.cls}"><div class="who">${esc(meta.who)}</div>${esc(m.text)}${media}<div class="t">${new Date(m.ts).toLocaleString()} ${m.dir==='out'?(m.status||''):''}</div></div>`;
   }).join('');
 }
+async function loadMedia(){
+  const imgs=document.querySelectorAll('img.pmedia:not([data-loaded])');
+  for(const img of imgs){
+    img.setAttribute('data-loaded','1');
+    try{ const r=await api('/media/'+img.getAttribute('data-mid')); if(r.ok){ img.src=URL.createObjectURL(await r.blob()); } }catch(e){}
+  }
+}
+async function openMedia(id){ try{ const r=await api('/media/'+id); const b=await r.blob(); window.open(URL.createObjectURL(b),'_blank'); }catch(e){} }
 // update messages without stealing the composer text/focus
 function renderChatUpdate(id){
   const c=cache[id]; const box=document.getElementById('msgs'); if(!box) return;
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
   box.innerHTML = renderMsgs(c);
+  loadMedia();
   if(atBottom) box.scrollTop=box.scrollHeight;
   // refresh banner state if human-control changed
   const chat=document.getElementById('chat');
@@ -492,6 +514,50 @@ async function addExec(){
     document.getElementById('exName').value=''; document.getElementById('exPhone').value='';
     loadExecs();
   }catch(e){}
+}
+
+/* ---------- broadcast (bulk promo) ---------- */
+let BC_RECIPIENTS=[];
+function renderBroadcast(){
+  document.getElementById('app').innerHTML = `
+    <div class="bcast">
+      <h2>📣 Broadcast a promotion</h2>
+      <p class="sub">Sends an approved WhatsApp <b>marketing template</b> (promo_generic) to your customers. Each message greets the customer by name and includes your text.</p>
+      <div class="warn">⚠️ WhatsApp rules: only message customers who agreed to receive offers. Un-opted-in or spam-flagged contacts are skipped automatically. Customers can reply <b>STOP</b> to opt out.</div>
+      <label>Promotion message</label>
+      <textarea id="bcMsg" placeholder="e.g. This week only — 15% off all health supplements at Mukesh Medical! Visit us or reply here to order."></textarea>
+      <label>Recipients</label>
+      <div id="bcCount" class="sub">Loading customers…</div>
+      <div class="ck"><input type="checkbox" id="bcOptin"/><label style="margin:0;text-transform:none;letter-spacing:0;color:#111;font-size:13px" for="bcOptin">I confirm these customers have opted in to receive promotional messages.</label></div>
+      <button class="send" id="bcSend" onclick="sendBroadcast()">Send broadcast</button>
+      <div id="bcResult" style="margin-top:14px"></div>
+    </div>`;
+  loadBroadcastRecipients();
+}
+async function loadBroadcastRecipients(){
+  try{
+    const d=await (await api('/api/messages')).json();
+    BC_RECIPIENTS=(d.conversations||[]).filter(c=>!c.spam).map(c=>({waId:c.waId, name:c.name||''}));
+    const el=document.getElementById('bcCount'); if(el) el.textContent=`${BC_RECIPIENTS.length} customer(s) will receive this (spam-flagged excluded).`;
+  }catch(e){}
+}
+async function sendBroadcast(){
+  const msg=(document.getElementById('bcMsg').value||'').trim();
+  if(!msg){ alert('Please enter a promotion message.'); return; }
+  if(!document.getElementById('bcOptin').checked){ alert('Please confirm the customers have opted in.'); return; }
+  if(!BC_RECIPIENTS.length){ alert('No recipients.'); return; }
+  if(!confirm(`Send this promotion to ${BC_RECIPIENTS.length} customer(s)?`)) return;
+  const btn=document.getElementById('bcSend'); btn.disabled=true; btn.textContent='Sending…';
+  const recipients=BC_RECIPIENTS.map(r=>({waId:r.waId, name:r.name, params:[r.name||'there', msg]}));
+  try{
+    const r=await api('/api/campaigns/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'Promo '+new Date().toLocaleDateString(), templateName:'promo_generic', langCode:'en', recipients})});
+    const j=await r.json();
+    const s=j.summary||{};
+    document.getElementById('bcResult').innerHTML = j.ok
+      ? `<div class="warn" style="background:#e7ffdb;border-color:#bfe3b0;color:#0a6">✅ Done — sent ${s.sent||0}, failed ${s.failed||0}, skipped ${s.skipped||0} of ${s.total||0}.${(s.failed?' <br>Failures usually mean the <b>promo_generic</b> template is not approved in Meta yet.':'')}</div>`
+      : `<div class="warn">Could not send: ${esc(j.error||'error')}</div>`;
+  }catch(e){ document.getElementById('bcResult').innerHTML=`<div class="warn">Error sending.</div>`; }
+  btn.disabled=false; btn.textContent='Send broadcast';
 }
 
 /* ---------- connect (coexistence) ---------- */
