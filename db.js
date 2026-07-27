@@ -21,10 +21,15 @@ export async function initDb() {
       name            TEXT,
       booked          BOOLEAN NOT NULL DEFAULT FALSE,
       human_control   BOOLEAN NOT NULL DEFAULT FALSE,
+      spam            BOOLEAN NOT NULL DEFAULT FALSE,
+      note            TEXT,
       last_greeted_at TIMESTAMPTZ,
       created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    -- add columns for databases created before these fields existed
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS spam BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS note TEXT;
     CREATE TABLE IF NOT EXISTS messages (
       id         BIGSERIAL PRIMARY KEY,
       wa_msg_id  TEXT UNIQUE,
@@ -38,6 +43,12 @@ export async function initDb() {
     );
     CREATE INDEX IF NOT EXISTS idx_messages_wa_id ON messages(wa_id);
     CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
+    -- simple key/value store for app settings (e.g. Train MUKCARE instructions)
+    CREATE TABLE IF NOT EXISTS settings (
+      key        TEXT PRIMARY KEY,
+      value      TEXT,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
   `);
   console.log("DB schema ready (Postgres).");
 }
@@ -53,7 +64,7 @@ export async function upsertContact(waId, name) {
       [waId, name || null]
     );
   } else {
-    const c = mem.contacts[waId] || (mem.contacts[waId] = { wa_id: waId, name: waId, booked: false, human_control: false, updated: Date.now(), messages: [] });
+    const c = mem.contacts[waId] || (mem.contacts[waId] = { wa_id: waId, name: waId, booked: false, human_control: false, spam: false, note: null, updated: Date.now(), messages: [] });
     if (name) c.name = name;
   }
 }
@@ -95,7 +106,8 @@ export async function updateStatus(waMsgId, status) {
 export async function getConversations() {
   if (pool) {
     const { rows: cs } = await pool.query(
-      `SELECT wa_id, name, booked, human_control,
+      `SELECT wa_id, name, booked, human_control, spam, note,
+              EXTRACT(EPOCH FROM created_at)*1000 AS created,
               EXTRACT(EPOCH FROM updated_at)*1000 AS updated
        FROM contacts ORDER BY updated_at DESC`
     );
@@ -112,6 +124,9 @@ export async function getConversations() {
         name: c.name || c.wa_id,
         booked: c.booked,
         humanControl: c.human_control,
+        spam: c.spam,
+        note: c.note || "",
+        created: Number(c.created),
         updated: Number(c.updated),
         messages: ms.map(m => ({ id: m.wa_msg_id, dir: m.dir, type: m.type, text: m.body, ts: Number(m.ts), status: m.status }))
       });
@@ -120,15 +135,55 @@ export async function getConversations() {
   } else {
     return Object.values(mem.contacts)
       .sort((a, b) => (b.updated || 0) - (a.updated || 0))
-      .map(c => ({ waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, updated: c.updated, messages: c.messages }));
+      .map(c => ({ waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", created: c.created || c.updated, updated: c.updated, messages: c.messages }));
   }
 }
 
 export async function setContactFlag(waId, field, value) {
-  if (!["booked", "human_control"].includes(field)) return;
+  if (!["booked", "human_control", "spam"].includes(field)) return;
   if (pool) {
     await pool.query(`UPDATE contacts SET ${field} = $2, updated_at = now() WHERE wa_id = $1`, [waId, value]);
   } else if (mem.contacts[waId]) {
     mem.contacts[waId][field] = value;
+  }
+}
+
+// Update editable profile fields (name and/or note).
+export async function updateContact(waId, fields) {
+  if (!waId || !fields) return;
+  const { name, note } = fields;
+  if (pool) {
+    await pool.query(
+      `UPDATE contacts SET
+         name = COALESCE($2, name),
+         note = COALESCE($3, note),
+         updated_at = now()
+       WHERE wa_id = $1`,
+      [waId, name ?? null, note ?? null]
+    );
+  } else if (mem.contacts[waId]) {
+    if (name != null) mem.contacts[waId].name = name;
+    if (note != null) mem.contacts[waId].note = note;
+  }
+}
+
+// ---- Settings (key/value) ----
+const memSettings = {};
+export async function getSetting(key) {
+  if (pool) {
+    const { rows } = await pool.query(`SELECT value FROM settings WHERE key = $1`, [key]);
+    return rows[0]?.value ?? "";
+  }
+  return memSettings[key] ?? "";
+}
+export async function setSetting(key, value) {
+  if (pool) {
+    await pool.query(
+      `INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [key, value ?? ""]
+    );
+  } else {
+    memSettings[key] = value ?? "";
   }
 }

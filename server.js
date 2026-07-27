@@ -2,7 +2,7 @@
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
-import { initDb, addMessage, updateStatus, getConversations, setContactFlag, dbEnabled } from "./db.js";
+import { initDb, addMessage, updateStatus, getConversations, setContactFlag, updateContact, getSetting, setSetting, dbEnabled } from "./db.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -78,11 +78,34 @@ app.get("/api/messages", async (req, res) => {
   } catch (err) { console.error("messages err", err); res.status(500).json({ error: String(err) }); }
 });
 
-// ---- Toggle booked / human_control on a conversation ----
+// ---- Toggle booked / human_control / spam on a conversation ----
 app.post("/api/contact/:waId/flag", async (req, res) => {
   const { field, value } = req.body || {};
   try { await setContactFlag(req.params.waId, field, Boolean(value)); res.json({ ok: true }); }
   catch (err) { console.error("flag err", err); res.status(500).json({ error: String(err) }); }
+});
+
+// ---- Update editable profile fields (name, note) ----
+app.post("/api/contact/:waId", async (req, res) => {
+  const { name, note } = req.body || {};
+  try { await updateContact(req.params.waId, { name, note }); res.json({ ok: true }); }
+  catch (err) { console.error("contact update err", err); res.status(500).json({ error: String(err) }); }
+});
+
+// ---- App settings (Train MUKCARE instructions live here) ----
+app.get("/api/settings", async (req, res) => {
+  try {
+    res.json({
+      trainInstructions: await getSetting("train_instructions")
+    });
+  } catch (err) { console.error("settings get err", err); res.status(500).json({ error: String(err) }); }
+});
+app.post("/api/settings", async (req, res) => {
+  const { trainInstructions } = req.body || {};
+  try {
+    if (trainInstructions !== undefined) await setSetting("train_instructions", String(trainInstructions));
+    res.json({ ok: true });
+  } catch (err) { console.error("settings set err", err); res.status(500).json({ error: String(err) }); }
 });
 
 // ---- Send a reply ----
