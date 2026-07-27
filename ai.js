@@ -34,9 +34,18 @@ function formatHour12(h) {
   return `${twelve} ${period}`;
 }
 
-// Is the store open right now, given openHour/closeHour as 24h numbers?
-function isStoreOpenNow(now, openHour, closeHour) {
+// Convert any date to India Standard Time (the store's local time). The server
+// runs in UTC, so we must not use raw getHours()/getDay().
+function istDate(now) {
   const d = now instanceof Date ? now : new Date(now || Date.now());
+  return new Date(d.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+}
+
+// Is the store open right now? Open openHour-closeHour (24h), except on
+// closedDays (0=Sunday..6=Saturday). All evaluated in IST.
+function isStoreOpenNow(now, openHour, closeHour, closedDays = []) {
+  const d = istDate(now);
+  if (closedDays.includes(d.getDay())) return false;
   const hourFraction = d.getHours() + d.getMinutes() / 60;
   return hourFraction >= openHour && hourFraction < closeHour;
 }
@@ -146,11 +155,24 @@ function buildSystemPrompt({ contact, store, settings, now }) {
   const nowDate = now instanceof Date ? now : new Date(now || Date.now());
   const openHour = Number.isFinite(store?.openHour) ? store.openHour : 10;
   const closeHour = Number.isFinite(store?.closeHour) ? store.closeHour : 21;
+  const closedDays = Array.isArray(store?.closedDays) ? store.closedDays : [];
   const storeName = store?.name || "Mukesh Medical";
-  const hoursText = store?.hoursText || `${formatHour12(openHour)} - ${formatHour12(closeHour)}, every day`;
-  const open = isStoreOpenNow(nowDate, openHour, closeHour);
+  const hoursText = store?.hoursText || `${formatHour12(openHour)} - ${formatHour12(closeHour)}`;
+  const open = isStoreOpenNow(nowDate, openHour, closeHour, closedDays);
+  const closedToday = closedDays.includes(istDate(nowDate).getDay());
   const greet = shouldGreet(Array.isArray(contact?.messages) ? contact.messages : []);
   const custName = contact?.name && contact.name !== contact.waId ? contact.name : null;
+  const custAddress = contact?.address && String(contact.address).trim() !== "" ? String(contact.address).trim() : null;
+
+  let detailsBlock;
+  if (custName || custAddress) {
+    const lines = [];
+    if (custName) lines.push(`- Name: ${custName}`);
+    if (custAddress) lines.push(`- Delivery address: ${custAddress}`);
+    detailsBlock = `We already have these details for this customer:\n${lines.join("\n")}\nUse these directly - do NOT ask again for any detail we already have. Only ask for a detail that is missing. For home delivery, confirm the saved address ("Deliver to your saved address?") rather than asking for it fresh, unless the customer wants a different one.`;
+  } else {
+    detailsBlock = "We have no saved details for this customer yet - collect what you need during the order flow.";
+  }
   // Optional, forward-compatible field - only used if the integrator ever
   // starts passing a delivery-fee line on the store object. Not part of the
   // required interface, so it's fine if it's undefined.
@@ -175,9 +197,12 @@ Detect the customer's language AND script from their latest message, and reply i
 - Telugu written in Latin/Roman letters ("Tenglish", e.g. "meru open unnara") -> reply in Telugu but stay in Latin letters (transliterate). Do NOT switch to Telugu script.
 Set the "lang" field to "en", "hi", or "te" to describe the LANGUAGE (not the script) you detected/used.
 
+=== CUSTOMER DETAILS ON FILE ===
+${detailsBlock}
+
 === ORDER FLOW (guide the customer through this, one step at a time, do not dump every question at once) ===
 1. If it's a general enquiry (stock, timing, location, etc.), just help - no need to force the order flow.
-2. If the customer wants to order, first ask for the patient's name (phone number is captured automatically, do not ask for it). When the customer tells you the name, set the "patientName" field in your JSON to exactly that name.
+2. If the customer wants to order: ONLY ask for the patient's name if we do NOT already have it on file (see CUSTOMER DETAILS ON FILE above). If we have it, use it and move on. When the customer gives a name (or a different patient's name), set the "patientName" field in your JSON to exactly that name. The phone number is captured automatically - never ask for it.
 3. Ask how they'd like to order: type out the medicines, OR send a photo of the prescription.
 4. If typed: ask them to send each item as "Product name - Quantity" (example: "DOLO 650 - 3 strips"), and record every item they mention into "order.items".
 5. If prescription photo: just acknowledge you've received it and staff will process it. Do not interpret or discuss its contents (see safety rule 2).
@@ -190,7 +215,7 @@ Set the "lang" field to "en", "hi", or "te" to describe the LANGUAGE (not the sc
 ${greet && custName ? `This is the first message of a new session from a returning customer named "${custName}" (their previous inbound message was over 5 hours ago, or this is brand new). Greet them warmly by name once, e.g. "Namaste ${custName}!" style, adapted to their language.` : greet ? `This is the first message of a new session from a new contact. A warm, brief welcome is appropriate, but you do not have a name to use yet - ask for it naturally if relevant to the order flow.` : `This is a CONTINUING conversation, not the start of a new session. Do NOT greet them again or repeat "welcome back" - just respond to what they just said.`}
 
 === STORE HOURS ===
-${storeName} is open ${hoursText} (opens at ${formatHour12(openHour)}, closes at ${formatHour12(closeHour)}). Right now it is ${open ? "OPEN" : "CLOSED"}. If it is currently closed, you may still take the order normally, but add a brief, soft note that the team will process/confirm it after the store opens at ${formatHour12(openHour)}.
+${storeName} is open ${hoursText}, Monday to Saturday. It is CLOSED on Sundays. Right now the store is ${open ? "OPEN" : "CLOSED"}${closedToday ? " (today is Sunday - closed all day)" : ""}. If it is currently closed, you may still take the order normally, but add a brief, soft note that the team will process/confirm it after the store opens${closedToday ? " on Monday at " + formatHour12(openHour) : " at " + formatHour12(openHour)}. Never claim to be open when closed.
 
 === TAPPABLE REPLY BUTTONS ===
 For closed-choice questions, offer tappable buttons via the "buttons" field (max 3, each title <= 20 characters) so the customer can just tap instead of typing. Keep your "reply" text as the question itself. Use buttons for:

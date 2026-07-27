@@ -23,6 +23,7 @@ export async function initDb() {
       human_control   BOOLEAN NOT NULL DEFAULT FALSE,
       spam            BOOLEAN NOT NULL DEFAULT FALSE,
       note            TEXT,
+      address         TEXT,
       last_greeted_at TIMESTAMPTZ,
       created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -30,6 +31,7 @@ export async function initDb() {
     -- add columns for databases created before these fields existed
     ALTER TABLE contacts ADD COLUMN IF NOT EXISTS spam BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE contacts ADD COLUMN IF NOT EXISTS note TEXT;
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS address TEXT;
     CREATE TABLE IF NOT EXISTS messages (
       id         BIGSERIAL PRIMARY KEY,
       wa_msg_id  TEXT UNIQUE,
@@ -80,7 +82,7 @@ export async function upsertContact(waId, name) {
       [waId, name || null]
     );
   } else {
-    const c = mem.contacts[waId] || (mem.contacts[waId] = { wa_id: waId, name: waId, booked: false, human_control: false, spam: false, note: null, updated: Date.now(), messages: [] });
+    const c = mem.contacts[waId] || (mem.contacts[waId] = { wa_id: waId, name: waId, booked: false, human_control: false, spam: false, note: null, address: null, updated: Date.now(), messages: [] });
     if (name && (!c.name || c.name === c.wa_id)) c.name = name; // seed only, don't overwrite a set name
   }
 }
@@ -126,7 +128,7 @@ export async function updateStatus(waMsgId, status) {
 export async function getConversations() {
   if (pool) {
     const { rows: cs } = await pool.query(
-      `SELECT wa_id, name, booked, human_control, spam, note,
+      `SELECT wa_id, name, booked, human_control, spam, note, address,
               EXTRACT(EPOCH FROM created_at)*1000 AS created,
               EXTRACT(EPOCH FROM updated_at)*1000 AS updated
        FROM contacts ORDER BY updated_at DESC`
@@ -146,6 +148,7 @@ export async function getConversations() {
         humanControl: c.human_control,
         spam: c.spam,
         note: c.note || "",
+        address: c.address || "",
         created: Number(c.created),
         updated: Number(c.updated),
         messages: ms.map(m => ({ id: m.wa_msg_id, dir: m.dir, type: m.type, text: m.body, ts: Number(m.ts), status: m.status, bot: m.bot, mediaId: m.media_id }))
@@ -168,23 +171,49 @@ export async function setContactFlag(waId, field, value) {
   }
 }
 
-// Update editable profile fields (name and/or note).
+// Update editable profile fields (name, note, and/or address).
 export async function updateContact(waId, fields) {
   if (!waId || !fields) return;
-  const { name, note } = fields;
+  const { name, note, address } = fields;
   if (pool) {
     await pool.query(
       `UPDATE contacts SET
          name = COALESCE($2, name),
          note = COALESCE($3, note),
+         address = COALESCE($4, address),
          updated_at = now()
        WHERE wa_id = $1`,
-      [waId, name ?? null, note ?? null]
+      [waId, name ?? null, note ?? null, address ?? null]
     );
   } else if (mem.contacts[waId]) {
     if (name != null) mem.contacts[waId].name = name;
     if (note != null) mem.contacts[waId].note = note;
+    if (address != null) mem.contacts[waId].address = address;
   }
+}
+
+// Customer database: list all contacts (no messages) for the Customers tab.
+export async function listContacts() {
+  if (pool) {
+    const { rows } = await pool.query(
+      `SELECT wa_id, name, address, note, booked, spam,
+              EXTRACT(EPOCH FROM created_at)*1000 AS created,
+              EXTRACT(EPOCH FROM updated_at)*1000 AS updated
+       FROM contacts ORDER BY updated_at DESC`
+    );
+    return rows.map(c => ({ waId: c.wa_id, name: c.name || c.wa_id, phone: c.wa_id, address: c.address || "", note: c.note || "", booked: c.booked, spam: c.spam, created: Number(c.created), updated: Number(c.updated) }));
+  }
+  return Object.values(mem.contacts).sort((a, b) => (b.updated || 0) - (a.updated || 0))
+    .map(c => ({ waId: c.wa_id, name: c.name, phone: c.wa_id, address: c.address || "", note: c.note || "", booked: c.booked, spam: c.spam }));
+}
+
+// Manually create/update a customer record (walk-in / phone). Keyed by phone.
+export async function createCustomer({ phone, name, address, note }) {
+  const waId = String(phone || "").replace(/\D/g, "");
+  if (!waId) throw new Error("phone required");
+  await upsertContact(waId, name);
+  await updateContact(waId, { name, address, note });
+  return { waId, phone: waId, name, address, note };
 }
 
 // Fetch a single conversation (flags + full message history) for the AI.
@@ -192,7 +221,7 @@ export async function getConversation(waId) {
   if (!waId) return null;
   if (pool) {
     const { rows: cs } = await pool.query(
-      `SELECT wa_id, name, booked, human_control, spam, note FROM contacts WHERE wa_id = $1`,
+      `SELECT wa_id, name, booked, human_control, spam, note, address FROM contacts WHERE wa_id = $1`,
       [waId]
     );
     if (!cs[0]) return null;
@@ -204,13 +233,13 @@ export async function getConversation(waId) {
     );
     return {
       waId: c.wa_id, name: c.name || c.wa_id,
-      booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "",
+      booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "",
       messages: ms.map(m => ({ dir: m.dir, type: m.type, text: m.body, ts: Number(m.ts), status: m.status, bot: m.bot, mediaId: m.media_id }))
     };
   }
   const c = mem.contacts[waId];
   if (!c) return null;
-  return { waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", messages: c.messages };
+  return { waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "", messages: c.messages };
 }
 
 // ---- Media (prescription images/documents) ----

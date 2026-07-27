@@ -135,6 +135,7 @@
   <div class="nav" id="nav" style="display:none">
     <button class="navbtn active" id="nav-chats" onclick="setView('chats')">💬 Chats</button>
     <button class="navbtn" id="nav-orders" onclick="setView('orders')">📦 Orders</button>
+    <button class="navbtn" id="nav-customers" onclick="setView('customers')">👥 Customers</button>
     <button class="navbtn" id="nav-broadcast" onclick="setView('broadcast')">📣 Broadcast</button>
   </div>
   <div class="r">
@@ -157,6 +158,18 @@
       <input id="noAddr" placeholder="Delivery address (if delivery)"/>
     </div>
     <div class="foot"><button class="cancel" onclick="closeModal('newOrderBg')">Cancel</button><button class="ok" onclick="saveNewOrder()">Create order</button></div>
+  </div>
+</div>
+
+<!-- Add customer modal -->
+<div class="modal-bg" id="custBg">
+  <div class="modal">
+    <h2>Add customer</h2>
+    <p>Save a customer to your database. MUKCARE will recognise them by phone number and won't re-ask saved details.</p>
+    <div class="rowf"><input id="cuName" placeholder="Customer / patient name"/><input id="cuPhone" placeholder="Phone e.g. 9199…"/></div>
+    <input id="cuAddr" placeholder="Address (optional)" style="margin-bottom:8px"/>
+    <textarea id="cuNote" placeholder="Notes (optional)" style="min-height:60px"></textarea>
+    <div class="foot"><button class="cancel" onclick="closeModal('custBg')">Cancel</button><button class="ok" onclick="saveCustomer()">Save customer</button></div>
   </div>
 </div>
 
@@ -217,9 +230,10 @@ function startDashboard(){
 
 function setView(v){
   view=v;
-  ['chats','orders','broadcast'].forEach(x=>{ const b=document.getElementById('nav-'+x); if(b) b.classList.toggle('active', v===x); });
+  ['chats','orders','customers','broadcast'].forEach(x=>{ const b=document.getElementById('nav-'+x); if(b) b.classList.toggle('active', v===x); });
   if(v==='chats'){ renderInbox(); renderList(); if(active){ renderChat(active); renderProfile(active); } }
   else if(v==='orders'){ renderOrders(); loadOrders(); }
+  else if(v==='customers'){ renderCustomers(); loadCustomers(); }
   else if(v==='broadcast'){ renderBroadcast(); }
 }
 
@@ -372,6 +386,8 @@ function renderProfile(id){
     <label>Name</label>
     <input type="text" id="pname" value="${esc(c.name)}"/>
     <div class="ph" style="margin-top:6px">+${esc(c.waId)}</div>
+    <label>Address</label>
+    <input type="text" id="paddr" value="${esc(c.address||'')}" placeholder="Saved delivery address"/>
 
     <div class="row">
       <div><div class="lab">Booked</div><div class="sub">Order confirmed for this customer</div></div>
@@ -404,8 +420,9 @@ async function flag(id, field, value){
 async function saveProfile(id){
   const name=document.getElementById('pname').value.trim();
   const note=document.getElementById('pnote').value;
-  await api('/api/contact/'+encodeURIComponent(id),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,note})});
-  if(cache[id]){ cache[id].name=name; cache[id].note=note; }
+  const address=document.getElementById('paddr').value.trim();
+  await api('/api/contact/'+encodeURIComponent(id),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,note,address})});
+  if(cache[id]){ cache[id].name=name; cache[id].note=note; cache[id].address=address; }
   renderList();
   flash('Saved');
 }
@@ -513,6 +530,52 @@ async function addExec(){
   try{ await api('/api/execs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,phone})});
     document.getElementById('exName').value=''; document.getElementById('exPhone').value='';
     loadExecs();
+  }catch(e){}
+}
+
+/* ---------- customers database ---------- */
+let CUSTOMERS=[];
+function renderCustomers(){
+  document.getElementById('app').innerHTML = `
+    <div class="orders">
+      <div class="bar">
+        <h2>👥 Customers</h2>
+        <div class="acts">
+          <button class="mini" onclick="openAddCustomer()">+ Add customer</button>
+          <input id="cSearch" placeholder="Search name / number" oninput="renderCustomersTable()" style="padding:6px 10px;border:1px solid var(--bd);border-radius:6px;font-size:13px"/>
+          <button class="linkbtn" onclick="loadCustomers()">↻ Refresh</button>
+        </div>
+      </div>
+      <div id="custBody"><div class="empty">Loading…</div></div>
+    </div>`;
+}
+async function loadCustomers(){
+  try{ const d=await (await api('/api/customers')).json(); CUSTOMERS=d.customers||[]; renderCustomersTable(); }catch(e){}
+}
+function renderCustomersTable(){
+  const body=document.getElementById('custBody'); if(!body) return;
+  const q=(document.getElementById('cSearch')?.value||'').toLowerCase();
+  const rows=CUSTOMERS.filter(c=> !q || (c.name||'').toLowerCase().includes(q) || (c.phone||'').includes(q));
+  if(!rows.length){ body.innerHTML='<div class="empty">No customers yet. They\'re added automatically when they message, or add one manually.</div>'; return; }
+  body.innerHTML = `<table class="otable"><thead><tr><th>Name</th><th>Phone</th><th>Address</th><th>Notes</th></tr></thead><tbody>${
+    rows.map(c=>`<tr>
+      <td><b>${esc(c.name||'—')}</b>${c.booked?' <span class="pill2" style="background:#25D36622;color:#0a7d4b">booked</span>':''}${c.spam?' <span class="pill2" style="background:#ff4d4d22;color:#b00020">spam</span>':''}</td>
+      <td>${esc(c.phone||'')}</td>
+      <td>${esc(c.address||'—')}</td>
+      <td class="sub">${esc(c.note||'')}</td>
+    </tr>`).join('')
+  }</tbody></table>`;
+}
+function openAddCustomer(){ document.getElementById('custBg').style.display='flex'; }
+async function saveCustomer(){
+  const name=document.getElementById('cuName').value.trim();
+  const phone=document.getElementById('cuPhone').value.trim();
+  const address=document.getElementById('cuAddr').value.trim();
+  const note=document.getElementById('cuNote').value.trim();
+  if(!phone){ alert('Phone number is required (used to recognise the customer).'); return; }
+  try{ await api('/api/customers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,name,address,note})});
+    ['cuName','cuPhone','cuAddr','cuNote'].forEach(i=>document.getElementById(i).value='');
+    closeModal('custBg'); flash('Customer saved'); loadCustomers();
   }catch(e){}
 }
 

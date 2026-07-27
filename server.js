@@ -2,7 +2,7 @@
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
-import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, updateContact, getSetting, setSetting, saveMedia, getMedia, dbEnabled } from "./db.js";
+import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, updateContact, getSetting, setSetting, saveMedia, getMedia, listContacts, createCustomer, dbEnabled } from "./db.js";
 import { mukcareReply } from "./ai.js";
 import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, createExec, listExecs, setExecActive, execHandoffMessage } from "./orders.js";
 import { sendTemplate, sendOrderReady, sendOrderDispatched, sendOrderReminder, sendBillSent } from "./templates.js";
@@ -36,8 +36,8 @@ function requireAuth(req, res, next) {
   return res.status(401).json({ error: "unauthorized" });
 }
 
-// Store profile passed to MUKCARE (the AI). Hours 10am-9pm, every day.
-const AI_STORE = { name: "Mukesh Medical", openHour: 10, closeHour: 21, hoursText: "10 AM - 9 PM, every day" };
+// Store profile passed to MUKCARE (the AI). Hours 10am-9pm, Mon-Sat (closed Sunday=0).
+const AI_STORE = { name: "Mukesh Medical", openHour: 10, closeHour: 21, closedDays: [0], hoursText: "10 AM - 9 PM" };
 
 // Send a plain-text WhatsApp message and persist it. bot=true marks it as a MUKCARE reply.
 async function sendWhatsAppText(to, text, { bot = false } = {}) {
@@ -142,6 +142,10 @@ async function handleAiReply(waId) {
     // When the customer confirms the order, record it and send the real Order ID.
     if (result.order) {
       try {
+        // Remember the delivery address on the customer's record for next time.
+        if (result.order.fulfillment === "delivery" && result.order.location) {
+          await updateContact(waId, { address: result.order.location });
+        }
         const order = await createOrder({
           waId,
           customerName: convo.name,
@@ -149,7 +153,7 @@ async function handleAiReply(waId) {
           mode: result.order.mode,
           items: result.order.items,
           fulfillment: result.order.fulfillment,
-          address: result.order.location,
+          address: result.order.location || convo.address,
           status: "new"
         });
         await sendWhatsAppText(waId, `Your Order ID is ${order.order_code}. Please keep it for reference. 🙏`, { bot: true });
@@ -245,8 +249,8 @@ app.post("/api/contact/:waId/flag", requireAuth, async (req, res) => {
 
 // ---- Update editable profile fields (name, note) ----
 app.post("/api/contact/:waId", requireAuth, async (req, res) => {
-  const { name, note } = req.body || {};
-  try { await updateContact(req.params.waId, { name, note }); res.json({ ok: true }); }
+  const { name, note, address } = req.body || {};
+  try { await updateContact(req.params.waId, { name, note, address }); res.json({ ok: true }); }
   catch (err) { console.error("contact update err", err); res.status(500).json({ error: String(err) }); }
 });
 
@@ -331,6 +335,18 @@ app.post("/api/execs", requireAuth, async (req, res) => {
 app.post("/api/execs/:id/active", requireAuth, async (req, res) => {
   try { res.json({ ok: true, exec: await setExecActive(req.params.id, req.body?.active) }); }
   catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+// ---- Customer database ----
+app.get("/api/customers", requireAuth, async (req, res) => {
+  try { res.json({ customers: await listContacts() }); }
+  catch (err) { console.error("customers list err", err); res.status(500).json({ error: String(err) }); }
+});
+app.post("/api/customers", requireAuth, async (req, res) => {
+  const { phone, name, address, note } = req.body || {};
+  if (!phone) return res.status(400).json({ error: "phone required" });
+  try { res.json({ ok: true, customer: await createCustomer({ phone, name, address, note }) }); }
+  catch (err) { console.error("customer create err", err); res.status(500).json({ error: String(err) }); }
 });
 
 // ---- Prescription image / media (auth-gated; health data) ----
