@@ -119,12 +119,51 @@
 
 <script>
 let CFG=null, active=null, cache={}, filter='all', search='';
+let DASH_KEY = localStorage.getItem('mm_dash_key') || '';
+
+// Authenticated fetch for /api/* routes: attaches the dashboard password header.
+async function api(path, opts={}){
+  const headers = Object.assign({}, opts.headers||{}, DASH_KEY ? { 'x-dash-key': DASH_KEY } : {});
+  const r = await fetch(path, Object.assign({}, opts, { headers }));
+  if(r.status===401){ DASH_KEY=''; localStorage.removeItem('mm_dash_key'); renderLogin('Wrong password. Try again.'); throw new Error('unauthorized'); }
+  return r;
+}
 
 async function boot(){
   CFG = await (await fetch('/config')).json();
+  if(CFG.authRequired){
+    // Validate any stored key; if invalid/missing, show the login screen.
+    let ok=false;
+    if(DASH_KEY){ try{ ok=(await fetch('/api/verify',{headers:{'x-dash-key':DASH_KEY}})).ok; }catch(e){} }
+    if(!ok){ renderLogin(); return; }
+  }
+  startDashboard();
+}
+
+function startDashboard(){
   setStatus();
   if(!CFG.connected){ renderConnect(); }
   else { renderInbox(); refresh(); setInterval(refresh, 5000); }
+}
+
+function renderLogin(msg){
+  document.getElementById('app').innerHTML = `
+    <div class="wrap"><div class="connect" style="max-width:380px">
+      <h2>🔒 Mukesh Medical</h2>
+      <p>Enter the dashboard password to continue.</p>
+      ${msg?`<p style="color:#b00020">${esc(msg)}</p>`:''}
+      <input id="pw" type="password" placeholder="Password" style="width:100%;padding:11px 14px;border:1px solid #ccc;border-radius:8px;font-size:15px;margin-bottom:12px" onkeydown="if(event.key==='Enter')doLogin()"/>
+      <div><button onclick="doLogin()">Log in</button></div>
+    </div></div>`;
+  setTimeout(()=>{ const p=document.getElementById('pw'); if(p) p.focus(); }, 50);
+}
+async function doLogin(){
+  const pw=(document.getElementById('pw').value||'').trim(); if(!pw) return;
+  try{
+    const r=await fetch('/api/verify',{headers:{'x-dash-key':pw}});
+    if(r.ok){ DASH_KEY=pw; localStorage.setItem('mm_dash_key',pw); startDashboard(); }
+    else renderLogin('Wrong password. Try again.');
+  }catch(e){ renderLogin('Could not verify. Try again.'); }
 }
 function setStatus(){
   const s=document.getElementById('status');
@@ -152,7 +191,7 @@ function setFilter(f){ filter=f; renderInbox(); const q=document.getElementById(
 
 async function refresh(){
   try{
-    const d = await (await fetch('/api/messages')).json();
+    const d = await (await api('/api/messages')).json();
     if(d.persistent!==undefined && CFG){ CFG.persistent=d.persistent; setStatus(); }
     cache={}; (d.conversations||[]).forEach(c=>cache[c.waId]=c);
     renderList();
@@ -222,7 +261,7 @@ function renderChatUpdate(id){
 
 async function send(){
   const t=document.getElementById('txt'); const text=(t.value||'').trim(); if(!text||!active) return; t.value='';
-  const r=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({to:active,text})});
+  const r=await api('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({to:active,text})});
   if(!r.ok){ alert('Send failed: '+JSON.stringify(await r.json())); }
   refresh();
 }
@@ -263,14 +302,14 @@ function renderProfile(id){
   `;
 }
 async function flag(id, field, value){
-  await fetch('/api/contact/'+encodeURIComponent(id)+'/flag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({field,value})});
+  await api('/api/contact/'+encodeURIComponent(id)+'/flag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({field,value})});
   if(cache[id]){ cache[id][field==='human_control'?'humanControl':field]=value; }
   renderList(); if(active===id){ renderChat(id); renderProfile(id); }
 }
 async function saveProfile(id){
   const name=document.getElementById('pname').value.trim();
   const note=document.getElementById('pnote').value;
-  await fetch('/api/contact/'+encodeURIComponent(id),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,note})});
+  await api('/api/contact/'+encodeURIComponent(id),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,note})});
   if(cache[id]){ cache[id].name=name; cache[id].note=note; }
   renderList();
   flash('Saved');
@@ -279,12 +318,12 @@ async function saveProfile(id){
 /* ---------- Train MUKCARE ---------- */
 async function openTrain(){
   document.getElementById('trainBg').style.display='flex';
-  try{ const s=await (await fetch('/api/settings')).json(); document.getElementById('trainTxt').value=s.trainInstructions||''; }catch(e){}
+  try{ const s=await (await api('/api/settings')).json(); document.getElementById('trainTxt').value=s.trainInstructions||''; }catch(e){}
 }
 function closeTrain(){ document.getElementById('trainBg').style.display='none'; }
 async function saveTrain(){
   const v=document.getElementById('trainTxt').value;
-  await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trainInstructions:v})});
+  await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trainInstructions:v})});
   closeTrain(); flash('MUKCARE instructions saved');
 }
 

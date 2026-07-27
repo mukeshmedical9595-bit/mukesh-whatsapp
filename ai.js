@@ -101,6 +101,17 @@ function normalizeResult(parsed) {
   const intent = VALID_INTENTS.has(parsed.intent) ? parsed.intent : "other";
   const suggestBooked = Boolean(parsed.suggestBooked);
 
+  // Up to 3 tappable WhatsApp reply buttons. Each title is capped at 20 chars
+  // (WhatsApp's hard limit). Accept either ["Pickup","Delivery"] or
+  // [{id,title}] shapes from the model.
+  const buttons = Array.isArray(parsed.buttons)
+    ? parsed.buttons
+        .map((b) => (typeof b === "string" ? { title: b } : (b && typeof b === "object" ? b : null)))
+        .filter((b) => b && typeof b.title === "string" && b.title.trim() !== "")
+        .slice(0, 3)
+        .map((b, i) => ({ id: String(b.id || `opt_${i + 1}`).slice(0, 200), title: String(b.title).trim().slice(0, 20) }))
+    : [];
+
   let order = null;
   if (parsed.order && typeof parsed.order === "object") {
     const mode = VALID_MODES.has(parsed.order.mode) ? parsed.order.mode : "typed";
@@ -120,7 +131,7 @@ function normalizeResult(parsed) {
     }
   }
 
-  return { reply, lang, order, intent, suggestBooked, error: null };
+  return { reply, lang, order, intent, suggestBooked, buttons, error: null };
 }
 
 // -----------------------------------------------------------------------------
@@ -177,6 +188,13 @@ ${greet && custName ? `This is the first message of a new session from a returni
 === STORE HOURS ===
 ${storeName} is open ${hoursText} (opens at ${formatHour12(openHour)}, closes at ${formatHour12(closeHour)}). Right now it is ${open ? "OPEN" : "CLOSED"}. If it is currently closed, you may still take the order normally, but add a brief, soft note that the team will process/confirm it after the store opens at ${formatHour12(openHour)}.
 
+=== TAPPABLE REPLY BUTTONS ===
+For closed-choice questions, offer tappable buttons via the "buttons" field (max 3, each title <= 20 characters) so the customer can just tap instead of typing. Keep your "reply" text as the question itself. Use buttons for:
+- How to order -> buttons: ["Type medicines", "Send prescription"]
+- Pickup or delivery -> buttons: ["Store pickup", "Home delivery"]
+- Order read-back confirmation -> buttons: ["Confirm order", "Make changes"]
+Do NOT use buttons for open-ended questions (patient's name, typing out the item list, delivery location) - leave "buttons" as [] for those. Always write the button titles in the SAME language/script as your reply. When the customer taps a button, their next message will simply be that button's title text.
+
 === SPAM / IDLE CHATTER ===
 If the incoming message is clearly spam, a broadcast/forward, or idle chit-chat with no real intent (e.g. random forwarded links, "hi" with nothing further after you've already responded, testing messages), set intent:"spam" and keep the reply very short, or set reply to null if no response is warranted.
 
@@ -193,16 +211,28 @@ Respond with ONLY a single raw JSON object - no markdown code fences, no comment
     "readbackConfirmed": true
   },
   "intent": "enquiry" | "order" | "chitchat" | "spam" | "prescription" | "other",
-  "suggestBooked": true | false
+  "suggestBooked": true | false,
+  "buttons": [ { "id": "short_id", "title": "Button text" } ]
 }
 
-Example (customer just confirmed a typed order for home delivery):
+Example A (asking pickup vs delivery - offer buttons):
+{
+  "reply": "Would you like store pickup or home delivery?",
+  "lang": "en",
+  "order": null,
+  "intent": "order",
+  "suggestBooked": false,
+  "buttons": [ { "id": "pickup", "title": "Store pickup" }, { "id": "delivery", "title": "Home delivery" } ]
+}
+
+Example B (customer just confirmed a typed order for home delivery - no buttons needed):
 {
   "reply": "Perfect, confirming your order: DOLO 650 - 3 strips, Vicks Vaporub - 1. Home delivery to Kompally. Your order is placed! An Order ID will follow shortly.",
   "lang": "en",
   "order": { "mode": "typed", "items": [ { "name": "DOLO 650", "qty": "3 strips" }, { "name": "Vicks Vaporub", "qty": "1" } ], "fulfillment": "delivery", "location": "Kompally", "readbackConfirmed": true },
   "intent": "order",
-  "suggestBooked": true
+  "suggestBooked": true,
+  "buttons": []
 }
 
 Rules for the fields:
@@ -253,6 +283,7 @@ export async function mukcareReply({ contact, messages, settings, store, now }) 
     order: null,
     intent: "other",
     suggestBooked: false,
+    buttons: [],
     error,
   });
 

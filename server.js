@@ -19,8 +19,19 @@ const VERIFY_TOKEN   = process.env.VERIFY_TOKEN || "mukeshmedical_verify";
 let ACCESS_TOKEN     = process.env.ACCESS_TOKEN || "";
 let PHONE_NUMBER_ID  = process.env.PHONE_NUMBER_ID || "";
 let WABA_ID          = process.env.WABA_ID || "";
+const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "";
 
 const GRAPH = `https://graph.facebook.com/${GRAPH_VERSION}`;
+
+// Simple single-password gate for the dashboard API. The frontend sends the
+// password in the "x-dash-key" header (over HTTPS). If DASHBOARD_PASSWORD is
+// not configured, the gate is open (keeps the app usable during setup).
+function requireAuth(req, res, next) {
+  if (!DASHBOARD_PASSWORD) return next();
+  const key = req.header("x-dash-key") || "";
+  if (key === DASHBOARD_PASSWORD) return next();
+  return res.status(401).json({ error: "unauthorized" });
+}
 
 // Store profile passed to MUKCARE (the AI). Hours 10am-9pm, every day.
 const AI_STORE = { name: "Mukesh Medical", openHour: 10, closeHour: 21, hoursText: "10 AM - 9 PM, every day" };
@@ -41,6 +52,29 @@ async function sendWhatsAppText(to, text, { bot = false } = {}) {
   } catch (err) { console.error("sendWhatsAppText err", err); return { ok: false, status: 500, error: { error: String(err) } }; }
 }
 
+// Send an interactive message with up to 3 tappable reply buttons.
+// buttons: [{ id, title }]. Persists the body text (+ an options hint) for the dashboard.
+async function sendWhatsAppInteractive(to, bodyText, buttons, { bot = false } = {}) {
+  if (!ACCESS_TOKEN || !PHONE_NUMBER_ID) return { ok: false, status: 400, error: { error: "Not connected yet." } };
+  const btns = (buttons || []).slice(0, 3).map(b => ({ type: "reply", reply: { id: String(b.id).slice(0, 256), title: String(b.title).slice(0, 20) } }));
+  if (btns.length === 0) return sendWhatsAppText(to, bodyText, { bot });
+  try {
+    const r = await fetch(`${GRAPH}/${PHONE_NUMBER_ID}/messages`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messaging_product: "whatsapp", to, type: "interactive",
+        interactive: { type: "button", body: { text: bodyText }, action: { buttons: btns } }
+      })
+    });
+    const data = await r.json();
+    if (!r.ok) { console.error("send interactive err", data); return { ok: false, status: r.status, error: data }; }
+    const stored = `${bodyText}\n⤷ options: ${btns.map(b => b.reply.title).join(" · ")}`;
+    await addMessage(to, { wa_msg_id: data.messages?.[0]?.id, dir: "out", type: "interactive", body: stored, ts: Date.now(), status: "sent", bot });
+    return { ok: true, data };
+  } catch (err) { console.error("sendWhatsAppInteractive err", err); return { ok: false, status: 500, error: { error: String(err) } }; }
+}
+
 // MUKCARE auto-reply. Called from the webhook for each customer who just messaged.
 // Skips if AI is not configured, the chat is under human control, or marked spam.
 async function handleAiReply(waId) {
@@ -59,8 +93,12 @@ async function handleAiReply(waId) {
     });
     if (result.error) { console.error("MUKCARE error:", result.error); return; }
     if (result.reply) {
-      await sendWhatsAppText(waId, result.reply, { bot: true });
-      console.log(`MUKCARE -> ${waId}: ${result.reply}`);
+      if (result.buttons && result.buttons.length) {
+        await sendWhatsAppInteractive(waId, result.reply, result.buttons, { bot: true });
+      } else {
+        await sendWhatsAppText(waId, result.reply, { bot: true });
+      }
+      console.log(`MUKCARE -> ${waId}: ${result.reply}${result.buttons?.length ? " [buttons: " + result.buttons.map(b => b.title).join(", ") + "]" : ""}`);
     }
     if (result.suggestBooked) await setContactFlag(waId, "booked", true);
     // NOTE: result.order will be consumed in Phase 4 to create an Order + Order ID.
@@ -73,9 +111,13 @@ app.get("/config", (req, res) => {
     appId: APP_ID, configId: CONFIG_ID, graphVersion: GRAPH_VERSION,
     connected: Boolean(ACCESS_TOKEN && PHONE_NUMBER_ID),
     persistent: dbEnabled,
+    authRequired: Boolean(DASHBOARD_PASSWORD),
     phoneNumberId: PHONE_NUMBER_ID || null, wabaId: WABA_ID || null
   });
 });
+
+// Login check: frontend calls this with the x-dash-key header to validate the password.
+app.get("/api/verify", requireAuth, (req, res) => res.json({ ok: true }));
 
 // ---- Webhook verification ----
 app.get("/webhook", (req, res) => {
@@ -98,7 +140,9 @@ app.post("/webhook", async (req, res) => {
         const nameFor = (waId) => (contacts.find(c => c.wa_id === waId)?.profile?.name) || waId;
 
         for (const m of (v.messages || [])) {
-          const body = m.text?.body || (m.type ? `[${m.type}]` : "[message]");
+          // A tapped reply button / list item comes through as an interactive reply.
+          const btnTitle = m.interactive?.button_reply?.title || m.interactive?.list_reply?.title;
+          const body = m.text?.body || btnTitle || (m.type ? `[${m.type}]` : "[message]");
           const { inserted } = await addMessage(m.from, { wa_msg_id: m.id, dir: "in", type: m.type, body, ts: Number(m.timestamp) * 1000 || Date.now() }, nameFor(m.from));
           console.log(`IN  ${m.from}: ${body}`);
           if (inserted) aiTargets.add(m.from); // only reply to genuinely new messages
@@ -121,7 +165,7 @@ app.post("/webhook", async (req, res) => {
 });
 
 // ---- List conversations ----
-app.get("/api/messages", async (req, res) => {
+app.get("/api/messages", requireAuth, async (req, res) => {
   try {
     const conversations = await getConversations();
     res.json({ connected: Boolean(ACCESS_TOKEN && PHONE_NUMBER_ID), persistent: dbEnabled, conversations });
@@ -129,28 +173,28 @@ app.get("/api/messages", async (req, res) => {
 });
 
 // ---- Toggle booked / human_control / spam on a conversation ----
-app.post("/api/contact/:waId/flag", async (req, res) => {
+app.post("/api/contact/:waId/flag", requireAuth, async (req, res) => {
   const { field, value } = req.body || {};
   try { await setContactFlag(req.params.waId, field, Boolean(value)); res.json({ ok: true }); }
   catch (err) { console.error("flag err", err); res.status(500).json({ error: String(err) }); }
 });
 
 // ---- Update editable profile fields (name, note) ----
-app.post("/api/contact/:waId", async (req, res) => {
+app.post("/api/contact/:waId", requireAuth, async (req, res) => {
   const { name, note } = req.body || {};
   try { await updateContact(req.params.waId, { name, note }); res.json({ ok: true }); }
   catch (err) { console.error("contact update err", err); res.status(500).json({ error: String(err) }); }
 });
 
 // ---- App settings (Train MUKCARE instructions live here) ----
-app.get("/api/settings", async (req, res) => {
+app.get("/api/settings", requireAuth, async (req, res) => {
   try {
     res.json({
       trainInstructions: await getSetting("train_instructions")
     });
   } catch (err) { console.error("settings get err", err); res.status(500).json({ error: String(err) }); }
 });
-app.post("/api/settings", async (req, res) => {
+app.post("/api/settings", requireAuth, async (req, res) => {
   const { trainInstructions } = req.body || {};
   try {
     if (trainInstructions !== undefined) await setSetting("train_instructions", String(trainInstructions));
@@ -159,7 +203,7 @@ app.post("/api/settings", async (req, res) => {
 });
 
 // ---- Send a reply ----
-app.post("/api/send", async (req, res) => {
+app.post("/api/send", requireAuth, async (req, res) => {
   const { to, text } = req.body || {};
   if (!to || !text) return res.status(400).json({ error: "to and text required" });
   const r = await sendWhatsAppText(to, text, { bot: false });
