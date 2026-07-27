@@ -2,7 +2,8 @@
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
-import { initDb, addMessage, updateStatus, getConversations, setContactFlag, updateContact, getSetting, setSetting, dbEnabled } from "./db.js";
+import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, updateContact, getSetting, setSetting, dbEnabled } from "./db.js";
+import { mukcareReply } from "./ai.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -20,6 +21,51 @@ let PHONE_NUMBER_ID  = process.env.PHONE_NUMBER_ID || "";
 let WABA_ID          = process.env.WABA_ID || "";
 
 const GRAPH = `https://graph.facebook.com/${GRAPH_VERSION}`;
+
+// Store profile passed to MUKCARE (the AI). Hours 10am-9pm, every day.
+const AI_STORE = { name: "Mukesh Medical", openHour: 10, closeHour: 21, hoursText: "10 AM - 9 PM, every day" };
+
+// Send a plain-text WhatsApp message and persist it. bot=true marks it as a MUKCARE reply.
+async function sendWhatsAppText(to, text, { bot = false } = {}) {
+  if (!ACCESS_TOKEN || !PHONE_NUMBER_ID) return { ok: false, status: 400, error: { error: "Not connected yet." } };
+  try {
+    const r = await fetch(`${GRAPH}/${PHONE_NUMBER_ID}/messages`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ messaging_product: "whatsapp", to, type: "text", text: { body: text } })
+    });
+    const data = await r.json();
+    if (!r.ok) { console.error("send err", data); return { ok: false, status: r.status, error: data }; }
+    await addMessage(to, { wa_msg_id: data.messages?.[0]?.id, dir: "out", type: "text", body: text, ts: Date.now(), status: "sent", bot });
+    return { ok: true, data };
+  } catch (err) { console.error("sendWhatsAppText err", err); return { ok: false, status: 500, error: { error: String(err) } }; }
+}
+
+// MUKCARE auto-reply. Called from the webhook for each customer who just messaged.
+// Skips if AI is not configured, the chat is under human control, or marked spam.
+async function handleAiReply(waId) {
+  try {
+    if (!process.env.ANTHROPIC_API_KEY) return; // AI not enabled yet
+    const convo = await getConversation(waId);
+    if (!convo) return;
+    if (convo.humanControl || convo.spam) return;
+    const trainInstructions = await getSetting("train_instructions");
+    const result = await mukcareReply({
+      contact: { ...convo, messages: convo.messages },
+      messages: convo.messages,
+      settings: { trainInstructions },
+      store: AI_STORE,
+      now: new Date()
+    });
+    if (result.error) { console.error("MUKCARE error:", result.error); return; }
+    if (result.reply) {
+      await sendWhatsAppText(waId, result.reply, { bot: true });
+      console.log(`MUKCARE -> ${waId}: ${result.reply}`);
+    }
+    if (result.suggestBooked) await setContactFlag(waId, "booked", true);
+    // NOTE: result.order will be consumed in Phase 4 to create an Order + Order ID.
+  } catch (e) { console.error("handleAiReply err", e); }
+}
 
 // ---- Public config for the frontend (no secrets) ----
 app.get("/config", (req, res) => {
@@ -43,6 +89,7 @@ app.get("/webhook", (req, res) => {
 // ---- Webhook receiver ----
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200); // ack fast
+  const aiTargets = new Set();
   try {
     for (const e of (req.body.entry || [])) {
       for (const ch of (e.changes || [])) {
@@ -52,8 +99,9 @@ app.post("/webhook", async (req, res) => {
 
         for (const m of (v.messages || [])) {
           const body = m.text?.body || (m.type ? `[${m.type}]` : "[message]");
-          await addMessage(m.from, { wa_msg_id: m.id, dir: "in", type: m.type, body, ts: Number(m.timestamp) * 1000 || Date.now() }, nameFor(m.from));
+          const { inserted } = await addMessage(m.from, { wa_msg_id: m.id, dir: "in", type: m.type, body, ts: Number(m.timestamp) * 1000 || Date.now() }, nameFor(m.from));
           console.log(`IN  ${m.from}: ${body}`);
+          if (inserted) aiTargets.add(m.from); // only reply to genuinely new messages
         }
         // Replies sent from the WhatsApp Business app on the phone (coexistence echoes)
         for (const m of (v.message_echoes || v.smb_message_echoes || [])) {
@@ -67,6 +115,8 @@ app.post("/webhook", async (req, res) => {
         }
       }
     }
+    // After persisting inbound messages, let MUKCARE reply to each customer.
+    for (const t of aiTargets) await handleAiReply(t);
   } catch (err) { console.error("webhook err", err); }
 });
 
@@ -112,18 +162,9 @@ app.post("/api/settings", async (req, res) => {
 app.post("/api/send", async (req, res) => {
   const { to, text } = req.body || {};
   if (!to || !text) return res.status(400).json({ error: "to and text required" });
-  if (!ACCESS_TOKEN || !PHONE_NUMBER_ID) return res.status(400).json({ error: "Not connected yet." });
-  try {
-    const r = await fetch(`${GRAPH}/${PHONE_NUMBER_ID}/messages`, {
-      method: "POST",
-      headers: { "Authorization": `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ messaging_product: "whatsapp", to, type: "text", text: { body: text } })
-    });
-    const data = await r.json();
-    if (!r.ok) { console.error("send err", data); return res.status(r.status).json(data); }
-    await addMessage(to, { wa_msg_id: data.messages?.[0]?.id, dir: "out", type: "text", body: text, ts: Date.now(), status: "sent" });
-    res.json({ ok: true, data });
-  } catch (err) { console.error(err); res.status(500).json({ error: String(err) }); }
+  const r = await sendWhatsAppText(to, text, { bot: false });
+  if (!r.ok) return res.status(r.status || 400).json(r.error || { error: "send failed" });
+  res.json({ ok: true, data: r.data });
 });
 
 // ---- Embedded Signup callback (kept for completeness) ----

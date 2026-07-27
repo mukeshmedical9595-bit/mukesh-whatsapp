@@ -38,9 +38,11 @@ export async function initDb() {
       type       TEXT,
       body       TEXT,
       status     TEXT,
+      bot        BOOLEAN NOT NULL DEFAULT FALSE,
       ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE messages ADD COLUMN IF NOT EXISTS bot BOOLEAN NOT NULL DEFAULT FALSE;
     CREATE INDEX IF NOT EXISTS idx_messages_wa_id ON messages(wa_id);
     CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
     -- simple key/value store for app settings (e.g. Train MUKCARE instructions)
@@ -70,22 +72,26 @@ export async function upsertContact(waId, name) {
 }
 
 // msg: { wa_msg_id, dir, type, body, status, ts(ms) }
+// Returns { inserted } - false if this wa_msg_id was already stored (webhook retry).
 export async function addMessage(waId, msg, name) {
-  if (!waId) return;
+  if (!waId) return { inserted: false };
   await upsertContact(waId, name);
   if (pool) {
-    await pool.query(
-      `INSERT INTO messages (wa_msg_id, wa_id, dir, type, body, status, ts)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
+    const r = await pool.query(
+      `INSERT INTO messages (wa_msg_id, wa_id, dir, type, body, status, bot, ts)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
        ON CONFLICT (wa_msg_id) DO NOTHING`,
       [msg.wa_msg_id || null, waId, msg.dir, msg.type || null, msg.body || "", msg.status || null,
-       msg.ts ? new Date(msg.ts) : new Date()]
+       Boolean(msg.bot), msg.ts ? new Date(msg.ts) : new Date()]
     );
     await pool.query(`UPDATE contacts SET updated_at = now() WHERE wa_id = $1`, [waId]);
+    return { inserted: r.rowCount > 0 };
   } else {
     const c = mem.contacts[waId];
-    c.messages.push({ id: msg.wa_msg_id, dir: msg.dir, type: msg.type, text: msg.body, ts: msg.ts || Date.now(), status: msg.status });
+    if (msg.wa_msg_id && c.messages.some(x => x.id === msg.wa_msg_id)) return { inserted: false };
+    c.messages.push({ id: msg.wa_msg_id, dir: msg.dir, type: msg.type, text: msg.body, ts: msg.ts || Date.now(), status: msg.status, bot: Boolean(msg.bot) });
     c.updated = Date.now();
+    return { inserted: true };
   }
 }
 
@@ -114,7 +120,7 @@ export async function getConversations() {
     const out = [];
     for (const c of cs) {
       const { rows: ms } = await pool.query(
-        `SELECT wa_msg_id, dir, type, body, status,
+        `SELECT wa_msg_id, dir, type, body, status, bot,
                 EXTRACT(EPOCH FROM ts)*1000 AS ts
          FROM messages WHERE wa_id = $1 ORDER BY ts ASC`,
         [c.wa_id]
@@ -128,7 +134,7 @@ export async function getConversations() {
         note: c.note || "",
         created: Number(c.created),
         updated: Number(c.updated),
-        messages: ms.map(m => ({ id: m.wa_msg_id, dir: m.dir, type: m.type, text: m.body, ts: Number(m.ts), status: m.status }))
+        messages: ms.map(m => ({ id: m.wa_msg_id, dir: m.dir, type: m.type, text: m.body, ts: Number(m.ts), status: m.status, bot: m.bot }))
       });
     }
     return out;
@@ -165,6 +171,32 @@ export async function updateContact(waId, fields) {
     if (name != null) mem.contacts[waId].name = name;
     if (note != null) mem.contacts[waId].note = note;
   }
+}
+
+// Fetch a single conversation (flags + full message history) for the AI.
+export async function getConversation(waId) {
+  if (!waId) return null;
+  if (pool) {
+    const { rows: cs } = await pool.query(
+      `SELECT wa_id, name, booked, human_control, spam, note FROM contacts WHERE wa_id = $1`,
+      [waId]
+    );
+    if (!cs[0]) return null;
+    const c = cs[0];
+    const { rows: ms } = await pool.query(
+      `SELECT dir, type, body, status, bot, EXTRACT(EPOCH FROM ts)*1000 AS ts
+       FROM messages WHERE wa_id = $1 ORDER BY ts ASC`,
+      [waId]
+    );
+    return {
+      waId: c.wa_id, name: c.name || c.wa_id,
+      booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "",
+      messages: ms.map(m => ({ dir: m.dir, type: m.type, text: m.body, ts: Number(m.ts), status: m.status, bot: m.bot }))
+    };
+  }
+  const c = mem.contacts[waId];
+  if (!c) return null;
+  return { waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", messages: c.messages };
 }
 
 // ---- Settings (key/value) ----
