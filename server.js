@@ -2,7 +2,7 @@
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
-import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, updateContact, getSetting, setSetting, saveMedia, getMedia, listContacts, createCustomer, dbEnabled } from "./db.js";
+import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, updateContact, getSetting, setSetting, saveMedia, getMedia, listContacts, createCustomer, deleteContact, getLatestImageMediaId, dbEnabled } from "./db.js";
 import { mukcareReply } from "./ai.js";
 import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, createExec, listExecs, setExecActive, execHandoffMessage } from "./orders.js";
 import { sendTemplate, sendOrderReady, sendOrderDispatched, sendOrderReminder, sendBillSent } from "./templates.js";
@@ -363,6 +363,26 @@ app.post("/api/customers", requireAuth, async (req, res) => {
   if (!phone) return res.status(400).json({ error: "phone required" });
   try { res.json({ ok: true, customer: await createCustomer({ phone, name, address, note }) }); }
   catch (err) { console.error("customer create err", err); res.status(500).json({ error: String(err) }); }
+});
+// Edit a customer's fields (name/address/note) without touching the phone/history.
+app.post("/api/customers/:waId", requireAuth, async (req, res) => {
+  const { name, address, note } = req.body || {};
+  try { await updateContact(req.params.waId, { name, address, note }); res.json({ ok: true }); }
+  catch (err) { console.error("customer edit err", err); res.status(500).json({ error: String(err) }); }
+});
+// Delete a customer record (and their chat history). Operated by staff.
+app.post("/api/customers/:waId/delete", requireAuth, async (req, res) => {
+  try { await deleteContact(req.params.waId); res.json({ ok: true }); }
+  catch (err) { console.error("customer delete err", err); res.status(500).json({ error: String(err) }); }
+});
+// Full order detail, including the customer's latest prescription image (if any).
+app.get("/api/orders/:id/detail", requireAuth, async (req, res) => {
+  try {
+    const order = await getOrder(req.params.id);
+    if (!order) return res.status(404).json({ error: "not found" });
+    const prescriptionMediaId = order.wa_id ? await getLatestImageMediaId(order.wa_id) : null;
+    res.json({ order, prescriptionMediaId });
+  } catch (err) { console.error("order detail err", err); res.status(500).json({ error: String(err) }); }
 });
 
 // ---- Prescription image / media (auth-gated; health data) ----

@@ -164,7 +164,7 @@
 <!-- Add customer modal -->
 <div class="modal-bg" id="custBg">
   <div class="modal">
-    <h2>Add customer</h2>
+    <h2 id="custTitle">Add customer</h2>
     <p>Save a customer to your database. MUKCARE will recognise them by phone number and won't re-ask saved details.</p>
     <div class="rowf"><input id="cuName" placeholder="Customer / patient name"/><input id="cuPhone" placeholder="Phone e.g. 9199…"/></div>
     <input id="cuAddr" placeholder="Address (optional)" style="margin-bottom:8px"/>
@@ -181,6 +181,15 @@
     <div id="execsList"></div>
     <div class="rowf" style="margin-top:10px"><input id="exName" placeholder="Name"/><input id="exPhone" placeholder="WhatsApp number e.g. 9199…"/></div>
     <div class="foot"><button class="cancel" onclick="closeModal('execsBg')">Close</button><button class="ok" onclick="addExec()">Add staff</button></div>
+  </div>
+</div>
+
+<!-- Order detail modal -->
+<div class="modal-bg" id="orderDetailBg">
+  <div class="modal">
+    <h2>Order details</h2>
+    <div id="orderDetailBody">Loading…</div>
+    <div class="foot"><button class="cancel" onclick="closeModal('orderDetailBg')">Close</button></div>
   </div>
 </div>
 
@@ -462,6 +471,7 @@ function renderOrders(){
         <h2>📦 Orders</h2>
         <div class="acts">
           <button class="mini" onclick="openNewOrder()">+ New order</button>
+          <button class="mini" style="background:#2c6e49" onclick="downloadSelectedOrders()">⬇ Download selected</button>
           <button class="mini" style="background:#555" onclick="openExecs()">🛵 Delivery staff</button>
           <button class="linkbtn" onclick="loadOrders()">↻ Refresh</button>
         </div>
@@ -480,7 +490,8 @@ function renderOrdersTable(){
   const body=document.getElementById('ordersBody'); if(!body) return;
   if(!ORDERS.length){ body.innerHTML='<div class="empty">No orders yet. Confirmed WhatsApp orders appear here automatically, or add one manually.</div>'; return; }
   body.innerHTML = `<table class="otable"><thead><tr>
-    <th>Order ID</th><th>When</th><th>Customer</th><th>Items</th><th>Fulfilment</th><th>Status</th><th>Delivery staff</th></tr></thead><tbody>${
+    <th><input type="checkbox" onclick="toggleAllOrders(this.checked)"></th>
+    <th>Order ID</th><th>When</th><th>Customer</th><th>Items</th><th>Fulfilment</th><th>Status</th><th>Delivery staff</th><th></th></tr></thead><tbody>${
     ORDERS.map(o=>{
       const items=(Array.isArray(o.items)?o.items:[]).map(it=>esc(it.name)+(it.qty?(' – '+esc(it.qty)):'')).join('<br>') || (o.mode==='prescription'?'<i>Prescription</i>':'—');
       const isDelivery=o.fulfillment==='delivery';
@@ -489,16 +500,60 @@ function renderOrdersTable(){
           <option value="">— assign —</option>${EXECS.map(e=>`<option value="${e.id}" ${String(o.exec_id)===String(e.id)?'selected':''}>${esc(e.name||e.phone)}</option>`).join('')}
         </select>${o.exec_id?` <button class="mini" onclick="notifyExec('${o.id}')">Send</button>`:''}` : '<span class="sub">—</span>';
       return `<tr style="${cancelled?'opacity:.5':''}">
-        <td><span class="ocode">${esc(o.order_code||'—')}</span></td>
+        <td><input type="checkbox" class="ocheck" value="${o.id}"></td>
+        <td><span class="ocode" style="cursor:pointer;text-decoration:underline" onclick="openOrderDetail('${o.id}')">${esc(o.order_code||'—')}</span></td>
         <td class="sub">${new Date(o.created_at).toLocaleString()}</td>
         <td><b>${esc(o.customer_name||'—')}</b><br><span class="sub">${esc(o.phone||'')}</span></td>
         <td>${items}</td>
         <td>${isDelivery?'🛵 Delivery':'🏪 Pickup'}${o.address?('<br><span class="sub">'+esc(o.address)+'</span>'):''}</td>
         <td><select class="ostatus" onchange="setOrderStatus('${o.id}',this.value)">${OSTATUSES.map(s=>`<option ${o.status===s?'selected':''}>${s}</option>`).join('')}</select></td>
         <td>${execCell}</td>
+        <td><button class="mini" onclick="openOrderDetail('${o.id}')">View</button></td>
       </tr>`;
     }).join('')
   }</tbody></table>`;
+}
+function toggleAllOrders(checked){ document.querySelectorAll('.ocheck').forEach(c=>c.checked=checked); }
+function csvCell(v){ v=(v==null?'':String(v)).replace(/"/g,'""'); return `"${v}"`; }
+function downloadSelectedOrders(){
+  const ids=[...document.querySelectorAll('.ocheck:checked')].map(c=>c.value);
+  const sel = ids.length ? ORDERS.filter(o=>ids.includes(String(o.id))) : ORDERS;
+  if(!sel.length){ alert('No orders to download.'); return; }
+  const rows=[['Order ID','Date','Customer','Phone','Type','Items','Fulfilment','Address','Status']];
+  sel.forEach(o=>{
+    const items=(Array.isArray(o.items)?o.items:[]).map(it=>it.name+(it.qty?(' - '+it.qty):'')).join('; ') || (o.mode==='prescription'?'Prescription':'');
+    rows.push([o.order_code,new Date(o.created_at).toLocaleString(),o.customer_name||'',o.phone||'',o.mode||'',items,o.fulfillment||'',o.address||'',o.status||'']);
+  });
+  const csv=rows.map(r=>r.map(csvCell).join(',')).join('\r\n');
+  const blob=new Blob([csv],{type:'text/csv'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
+  a.download=`mukesh-orders-${new Date().toISOString().slice(0,10)}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  flash(`Downloaded ${sel.length} order(s)`);
+}
+async function openOrderDetail(id){
+  document.getElementById('orderDetailBg').style.display='flex';
+  const box=document.getElementById('orderDetailBody'); box.innerHTML='Loading…';
+  try{
+    const d=await (await api('/api/orders/'+id+'/detail')).json();
+    const o=d.order||{};
+    const items=(Array.isArray(o.items)?o.items:[]).map(it=>`<li>${esc(it.name)}${it.qty?(' – '+esc(it.qty)):''}</li>`).join('') || (o.mode==='prescription'?'<i>Prescription order (see image below)</i>':'—');
+    let img='';
+    if(d.prescriptionMediaId){ img=`<div style="margin-top:10px"><b>Prescription / photo sent by customer:</b><br><img id="odImg" style="max-width:100%;border-radius:8px;margin-top:6px;background:#eee;min-height:40px"/></div>`; }
+    box.innerHTML=`
+      <div style="font-size:14px;line-height:1.7">
+        <div><b>Order ID:</b> <span class="ocode">${esc(o.order_code||'—')}</span></div>
+        <div><b>Date:</b> ${new Date(o.created_at).toLocaleString()}</div>
+        <div><b>Customer:</b> ${esc(o.customer_name||'—')} (${esc(o.phone||'')})</div>
+        <div><b>Fulfilment:</b> ${o.fulfillment==='delivery'?'🛵 Home delivery':'🏪 Store pickup'}</div>
+        ${o.address?`<div><b>Address:</b> ${esc(o.address)}</div>`:''}
+        <div><b>Status:</b> ${esc(o.status||'')}</div>
+        <div style="margin-top:6px"><b>Items:</b><ul style="margin:4px 0 0 18px">${items}</ul></div>
+        ${o.notes?`<div style="margin-top:6px"><b>Notes:</b> ${esc(o.notes)}</div>`:''}
+        ${img}
+      </div>`;
+    if(d.prescriptionMediaId){ try{ const r=await api('/media/'+d.prescriptionMediaId); document.getElementById('odImg').src=URL.createObjectURL(await r.blob()); }catch(e){} }
+  }catch(e){ box.innerHTML='Could not load order.'; }
 }
 async function setOrderStatus(id,status){ try{ await api('/api/orders/'+id+'/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status})}); flash('Status → '+status); const o=ORDERS.find(x=>String(x.id)===String(id)); if(o)o.status=status; }catch(e){} }
 async function assignExec(id,execId){ try{ await api('/api/orders/'+id+'/assign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({execId:execId||null})}); loadOrders(); }catch(e){} }
@@ -557,26 +612,53 @@ function renderCustomersTable(){
   const q=(document.getElementById('cSearch')?.value||'').toLowerCase();
   const rows=CUSTOMERS.filter(c=> !q || (c.name||'').toLowerCase().includes(q) || (c.phone||'').includes(q));
   if(!rows.length){ body.innerHTML='<div class="empty">No customers yet. They\'re added automatically when they message, or add one manually.</div>'; return; }
-  body.innerHTML = `<table class="otable"><thead><tr><th>Name</th><th>Phone</th><th>Address</th><th>Notes</th></tr></thead><tbody>${
+  body.innerHTML = `<table class="otable"><thead><tr><th>Name</th><th>Phone</th><th>Address</th><th>Notes</th><th>Actions</th></tr></thead><tbody>${
     rows.map(c=>`<tr>
       <td><b>${esc(c.name||'—')}</b>${c.booked?' <span class="pill2" style="background:#25D36622;color:#0a7d4b">booked</span>':''}${c.spam?' <span class="pill2" style="background:#ff4d4d22;color:#b00020">spam</span>':''}</td>
       <td>${esc(c.phone||'')}</td>
       <td>${esc(c.address||'—')}</td>
       <td class="sub">${esc(c.note||'')}</td>
+      <td style="white-space:nowrap"><button class="mini" onclick="editCustomer('${c.waId}')">Edit</button> <button class="mini" style="background:#c0392b" onclick="deleteCustomer('${c.waId}')">Delete</button></td>
     </tr>`).join('')
   }</tbody></table>`;
 }
-function openAddCustomer(){ document.getElementById('custBg').style.display='flex'; }
+let editingCustomer=null;
+function openAddCustomer(){
+  editingCustomer=null;
+  document.getElementById('custTitle').textContent='Add customer';
+  ['cuName','cuPhone','cuAddr','cuNote'].forEach(i=>document.getElementById(i).value='');
+  document.getElementById('cuPhone').readOnly=false;
+  document.getElementById('custBg').style.display='flex';
+}
+function editCustomer(waId){
+  const c=CUSTOMERS.find(x=>x.waId===waId); if(!c) return;
+  editingCustomer=waId;
+  document.getElementById('custTitle').textContent='Edit customer';
+  document.getElementById('cuName').value=c.name||'';
+  document.getElementById('cuPhone').value=c.phone||''; document.getElementById('cuPhone').readOnly=true;
+  document.getElementById('cuAddr').value=c.address||'';
+  document.getElementById('cuNote').value=c.note||'';
+  document.getElementById('custBg').style.display='flex';
+}
 async function saveCustomer(){
   const name=document.getElementById('cuName').value.trim();
   const phone=document.getElementById('cuPhone').value.trim();
   const address=document.getElementById('cuAddr').value.trim();
   const note=document.getElementById('cuNote').value.trim();
-  if(!phone){ alert('Phone number is required (used to recognise the customer).'); return; }
-  try{ await api('/api/customers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,name,address,note})});
-    ['cuName','cuPhone','cuAddr','cuNote'].forEach(i=>document.getElementById(i).value='');
+  try{
+    if(editingCustomer){
+      await api('/api/customers/'+encodeURIComponent(editingCustomer),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,address,note})});
+    } else {
+      if(!phone){ alert('Phone number is required (used to recognise the customer).'); return; }
+      await api('/api/customers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,name,address,note})});
+    }
     closeModal('custBg'); flash('Customer saved'); loadCustomers();
   }catch(e){}
+}
+async function deleteCustomer(waId){
+  const c=CUSTOMERS.find(x=>x.waId===waId);
+  if(!confirm(`Delete customer "${c?c.name:waId}" and their chat history? This cannot be undone.`)) return;
+  try{ await api('/api/customers/'+encodeURIComponent(waId)+'/delete',{method:'POST'}); flash('Customer deleted'); loadCustomers(); }catch(e){}
 }
 
 /* ---------- broadcast (bulk promo) ---------- */

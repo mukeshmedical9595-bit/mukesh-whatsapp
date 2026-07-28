@@ -216,6 +216,28 @@ export async function createCustomer({ phone, name, address, note }) {
   return { waId, phone: waId, name, address, note };
 }
 
+// Delete a customer and their messages (cascades). Operated by staff from the UI.
+export async function deleteContact(waId) {
+  if (!waId) return;
+  if (pool) { await pool.query(`DELETE FROM contacts WHERE wa_id = $1`, [waId]); }
+  else { delete mem.contacts[waId]; }
+}
+
+// Most recent image (e.g. prescription) sent by a customer - for the order detail view.
+export async function getLatestImageMediaId(waId) {
+  if (!waId) return null;
+  if (pool) {
+    const { rows } = await pool.query(
+      `SELECT media_id FROM messages WHERE wa_id=$1 AND type='image' AND media_id IS NOT NULL ORDER BY ts DESC LIMIT 1`,
+      [waId]
+    );
+    return rows[0]?.media_id || null;
+  }
+  const c = mem.contacts[waId]; if (!c) return null;
+  const imgs = c.messages.filter(m => m.type === "image" && m.mediaId);
+  return imgs.length ? imgs[imgs.length - 1].mediaId : null;
+}
+
 // Fetch a single conversation (flags + full message history) for the AI.
 export async function getConversation(waId) {
   if (!waId) return null;
