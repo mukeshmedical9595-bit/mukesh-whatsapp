@@ -54,6 +54,13 @@ export const TEMPLATES = {
     lang: "en",
     category: "MARKETING",
     paramOrder: ["name", "message"]
+  },
+  // Sent to a delivery executive with the order + customer details.
+  DELIVERY_ASSIGN: {
+    name: "delivery_assignment",
+    lang: "en",
+    category: "UTILITY",
+    paramOrder: ["orderCode", "customerName", "phone", "address", "items"]
   }
 };
 
@@ -148,4 +155,10 @@ export async function sendBillSent(to, { name, orderCode, amount } = {}) {
 export async function sendPromoGeneric(to, { name, message } = {}) {
   const t = TEMPLATES.PROMO_GENERIC;
   return sendTemplate(to, t.name, t.lang, [name, message]);
+}
+
+/** Notify a delivery executive of an assigned order with customer details. */
+export async function sendDeliveryAssignment(to, { orderCode, customerName, phone, address, items } = {}) {
+  const t = TEMPLATES.DELIVERY_ASSIGN;
+  return sendTemplate(to, t.name, t.lang, [orderCode, customerName, phone, address, items]);
 }

@@ -5,7 +5,7 @@ import { fileURLToPath } from "url";
 import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, updateContact, getSetting, setSetting, saveMedia, getMedia, listContacts, createCustomer, deleteContact, getLatestImageMediaId, dbEnabled } from "./db.js";
 import { mukcareReply } from "./ai.js";
 import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, deleteOrder, createExec, listExecs, setExecActive, execHandoffMessage } from "./orders.js";
-import { sendTemplate, sendOrderReady, sendOrderDispatched, sendOrderReminder, sendBillSent } from "./templates.js";
+import { sendTemplate, sendOrderReady, sendOrderDispatched, sendOrderReminder, sendBillSent, sendDeliveryAssignment } from "./templates.js";
 import { initCampaignsDb, sendCampaign, recordOptOut } from "./campaigns.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -134,8 +134,12 @@ async function notifyDispatch(order) {
     if (order.exec_id) {
       const exec = (await listExecs()).find(e => String(e.id) === String(order.exec_id));
       const execPhone = normalizePhone(exec?.phone);
-      if (execPhone) await sendWhatsAppText(execPhone, execHandoffMessage(order, exec), { bot: false });
-      else console.warn("notifyDispatch: assigned exec has no phone", order.exec_id);
+      if (execPhone) {
+        const items = (Array.isArray(order.items) ? order.items : []).map(it => it.name + (it.qty ? (" - " + it.qty) : "")).join(", ") || (order.mode === "prescription" ? "Prescription order" : "-");
+        let r = null;
+        try { r = await sendDeliveryAssignment(execPhone, { orderCode: order.order_code, customerName: order.customer_name || "-", phone: order.phone || order.wa_id || "-", address: order.address || "-", items }); } catch (e) {}
+        if (!r?.ok) await sendWhatsAppText(execPhone, execHandoffMessage(order, exec), { bot: false }); // fallback (needs open chat)
+      } else console.warn("notifyDispatch: assigned exec has no phone", order.exec_id);
     }
   } catch (e) { console.error("notifyDispatch err", e); }
 }
@@ -494,6 +498,9 @@ const MUKCARE_TEMPLATE_DEFS = [
   { name: "promo_generic", category: "MARKETING",
     body: "Hi {{1}}, {{2}} Reply STOP to opt out. - Mukesh Medical",
     example: ["Rahul", "This week: 15% off on all health supplements!"] },
+  { name: "delivery_assignment", category: "UTILITY",
+    body: "New delivery assigned - order {{1}}. Customer: {{2}}, phone {{3}}. Deliver to: {{4}}. Items: {{5}}. Payment: collect on delivery unless paid at billing.",
+    example: ["MM-260728-001", "Suresh Raina", "9876543210", "https://maps.google.com/?q=17.4,78.4", "DOLO 650 - 2 strips"] },
 ];
 
 app.post("/api/admin/create-templates", requireAuth, async (req, res) => {
