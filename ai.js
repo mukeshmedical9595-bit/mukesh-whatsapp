@@ -168,8 +168,11 @@ function buildSystemPrompt({ contact, store, settings, now }) {
   if (custName || custAddress) {
     const lines = [];
     if (custName) lines.push(`- Name: ${custName}`);
-    if (custAddress) lines.push(`- Delivery address: ${custAddress}`);
-    detailsBlock = `We already have these details for this customer:\n${lines.join("\n")}\nUse these directly - do NOT ask again for any detail we already have. Only ask for a detail that is missing. For home delivery, confirm the saved address ("Deliver to your saved address?") rather than asking for it fresh, unless the customer wants a different one.`;
+    if (custAddress) lines.push(`- Saved delivery address: ${custAddress}`);
+    const addrRule = custAddress
+      ? `For home delivery, you MAY confirm this saved address ("Deliver to your saved address?") instead of asking fresh, unless the customer wants a different one.`
+      : `IMPORTANT: We have NO saved delivery address for this customer. NEVER say we have a saved address. For home delivery, you MUST ask the customer to share their delivery location.`;
+    detailsBlock = `We already have these details for this customer:\n${lines.join("\n")}\nUse what we have - do NOT ask again for a detail we already have. Only ask for what is missing. ${addrRule}`;
   } else {
     detailsBlock = "We have no saved details for this customer yet - collect what you need during the order flow.";
   }
@@ -207,7 +210,7 @@ ${detailsBlock}
 4. If typed: ask them to send each item as "Product name - Quantity" (example: "DOLO 650 - 3 strips"), and record every item they mention into "order.items".
 5. If the customer sends a PHOTO, follow the "PHOTOS THE CUSTOMER SENDS" rules below.
 6. Ask whether they want store pickup or home delivery.
-7. If home delivery: ask for their location/area (address). DO NOT mention any delivery charge, fee, or distance at all - our team handles delivery charges separately after the order. If the customer asks about delivery charges, simply say our team will let them know, and do not quote any amount.
+7. If home delivery: ask the customer to share their delivery location - the best is their location pin (the 📍 attachment in WhatsApp) or a Google Maps link; a typed address also works. When they share a location pin or Maps link, treat that as the delivery address and put it in order.location (it is recorded automatically). DO NOT mention any delivery charge, fee, or distance at all - our team handles delivery charges separately after the order. If the customer asks about delivery charges, simply say our team will let them know, and do not quote any amount.
 8. Read the full order back to the customer (items, fulfillment method, location if delivery) and explicitly ask them to confirm.
 9. ONLY when the customer clearly confirms that readback: tell them the order is placed and an Order ID will follow shortly (the app generates the real ID - never invent one), and fill the "order" field in your JSON response for that turn with readbackConfirmed:true. On every other turn, "order" must be null.
 

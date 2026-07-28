@@ -173,8 +173,10 @@ async function handleAiReply(waId) {
     // When the customer confirms the order, record it and send the real Order ID.
     if (result.order) {
       try {
-        // Remember the delivery address on the customer's record for next time.
-        if (result.order.fulfillment === "delivery" && result.order.location) {
+        // Prefer a saved location (e.g. a shared Maps link) over a vague AI phrase.
+        const deliveryAddress = convo.address || result.order.location;
+        // Remember the address on the customer's record for next time (only if we don't already have one).
+        if (result.order.fulfillment === "delivery" && result.order.location && !convo.address) {
           await updateContact(waId, { address: result.order.location });
         }
         const order = await createOrder({
@@ -184,7 +186,7 @@ async function handleAiReply(waId) {
           mode: result.order.mode,
           items: result.order.items,
           fulfillment: result.order.fulfillment,
-          address: result.order.location || convo.address,
+          address: result.order.fulfillment === "delivery" ? deliveryAddress : null,
           status: "new"
         });
         await sendWhatsAppText(waId, `Your Order ID is ${order.order_code}. Please keep it for reference. 🙏`, { bot: true });
@@ -239,6 +241,13 @@ app.post("/webhook", async (req, res) => {
             const dl = await downloadWhatsAppMedia(mediaObj.id);
             if (dl) mediaId = await saveMedia({ waId: m.from, waMsgId: m.id, mime: dl.mime, buffer: dl.buffer });
             body = m.image ? "[photo]" : "[document]";
+          }
+          // A shared WhatsApp location -> Google Maps link, saved as the customer's delivery address.
+          if (m.type === "location" && m.location) {
+            const lat = m.location.latitude, lng = m.location.longitude;
+            const mapsLink = `https://maps.google.com/?q=${lat},${lng}`;
+            body = `📍 ${mapsLink}`;
+            try { await updateContact(m.from, { address: mapsLink }); } catch (e) { console.error("save location err", e); }
           }
           // Marketing opt-out: a bare "STOP" removes them from future campaigns.
           if ((m.text?.body || "").trim().toUpperCase() === "STOP") await recordOptOut(m.from);
@@ -299,6 +308,25 @@ app.post("/api/settings", requireAuth, async (req, res) => {
     if (trainInstructions !== undefined) await setSetting("train_instructions", String(trainInstructions));
     res.json({ ok: true });
   } catch (err) { console.error("settings set err", err); res.status(500).json({ error: String(err) }); }
+});
+
+// Live test sandbox: run MUKCARE on a test conversation using the CURRENT saved
+// training instructions - nothing is sent to WhatsApp or saved. Lets the owner
+// verify their training/commands work before going live.
+app.post("/api/mukcare-test", requireAuth, async (req, res) => {
+  try {
+    const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
+    const name = req.body?.customerName || "Test Customer";
+    const trainInstructions = await getSetting("train_instructions");
+    const result = await mukcareReply({
+      contact: { waId: "919999999999", name, messages },
+      messages,
+      settings: { trainInstructions },
+      store: AI_STORE,
+      now: new Date()
+    });
+    res.json({ ok: true, reply: result.reply, buttons: result.buttons || [], intent: result.intent, error: result.error });
+  } catch (err) { console.error("mukcare-test err", err); res.status(500).json({ error: String(err) }); }
 });
 
 // ---- Orders ----
