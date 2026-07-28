@@ -37,6 +37,16 @@ function requireAuth(req, res, next) {
   return res.status(401).json({ error: "unauthorized" });
 }
 
+// Normalise an Indian phone number to WhatsApp wa_id form (91XXXXXXXXXX).
+// We operate only in India, so a bare 10-digit number gets 91 prepended.
+function normalizePhone(p) {
+  let d = String(p || "").replace(/\D/g, "");
+  if (!d) return "";
+  if (d.length === 10) return "91" + d;
+  if (d.length === 11 && d.startsWith("0")) return "91" + d.slice(1);
+  return d; // already has a country code, or non-standard - leave as-is
+}
+
 // Store profile passed to MUKCARE (the AI). Hours 10am-9pm, Mon-Sat (closed Sunday=0).
 const AI_STORE = { name: "Mukesh Medical", openHour: 10, closeHour: 21, closedDays: [0], hoursText: "10 AM - 9 PM" };
 
@@ -92,15 +102,26 @@ async function downloadWhatsAppMedia(mediaId) {
   } catch (e) { console.error("downloadWhatsAppMedia err", e); return null; }
 }
 
+// Notify a customer of a status. Tries the approved TEMPLATE first (delivers even
+// outside WhatsApp's 24h window); if that fails (e.g. template not yet approved),
+// falls back to plain text (delivers only inside the 24h window).
+async function notifyCustomer(order, kind) {
+  const name = order.customer_name || "there", code = order.order_code || "";
+  const to = normalizePhone(order.wa_id || order.phone);
+  if (!to) return;
+  let r = null;
+  try { r = kind === "ready" ? await sendOrderReady(to, { name, orderCode: code }) : await sendOrderDispatched(to, { name, orderCode: code }); } catch (e) {}
+  if (r?.ok) { await addMessage(to, { wa_msg_id: r.id, dir: "out", type: "template", body: `[${kind}] Order ${code}`, ts: Date.now(), status: "sent", bot: true }); return; }
+  const txt = kind === "ready"
+    ? `Hi ${name}, your order ${code} is billed and ready for pickup at Mukesh Medical. Please collect it at your convenience. Thank you. 🙏`
+    : `Hi ${name}, your order ${code} has been billed and dispatched for home delivery. Our delivery team will reach you shortly. Thank you. 🙏`;
+  await sendWhatsAppText(to, txt, { bot: true });
+}
+
 // Pickup-ready notification (fired when status becomes billed_ready).
-// Plain text (works within WhatsApp's 24h service window - covers same-day billing).
 async function notifyOrderStatus(order) {
   try {
-    const name = order.customer_name || "there", code = order.order_code || "";
-    const to = order.wa_id || order.phone;
-    if (order.status === "billed_ready" && to) {
-      await sendWhatsAppText(to, `Hi ${name}, your order ${code} is billed and ready for pickup at Mukesh Medical. Please collect it at your convenience. Thank you. 🙏`, { bot: true });
-    }
+    if (order.status === "billed_ready") await notifyCustomer(order, "ready");
     // billed_dispatched notifications are sent when a delivery executive is assigned - see notifyDispatch().
   } catch (e) { console.error("notifyOrderStatus err", e); }
 }
@@ -109,12 +130,11 @@ async function notifyOrderStatus(order) {
 // billed_dispatched order. Messages the customer AND the delivery executive.
 async function notifyDispatch(order) {
   try {
-    const name = order.customer_name || "there", code = order.order_code || "";
-    const to = order.wa_id || order.phone;
-    if (to) await sendWhatsAppText(to, `Hi ${name}, your order ${code} has been billed and dispatched for home delivery. Our delivery team will reach you shortly. Thank you. 🙏`, { bot: true });
+    await notifyCustomer(order, "dispatched");
     if (order.exec_id) {
       const exec = (await listExecs()).find(e => String(e.id) === String(order.exec_id));
-      if (exec?.phone) await sendWhatsAppText(exec.phone, execHandoffMessage(order, exec), { bot: false });
+      const execPhone = normalizePhone(exec?.phone);
+      if (execPhone) await sendWhatsAppText(execPhone, execHandoffMessage(order, exec), { bot: false });
       else console.warn("notifyDispatch: assigned exec has no phone", order.exec_id);
     }
   } catch (e) { console.error("notifyDispatch err", e); }
@@ -339,10 +359,11 @@ app.get("/api/orders", requireAuth, async (req, res) => {
 app.post("/api/orders", requireAuth, async (req, res) => {
   const b = req.body || {};
   try {
+    const nPhone = normalizePhone(b.phone);
     const order = await createOrder({
-      waId: b.waId || null,
+      waId: b.waId || nPhone || null,
       customerName: b.customerName || null,
-      phone: b.phone || null,
+      phone: nPhone || null,
       mode: b.mode || "typed",
       items: Array.isArray(b.items) ? b.items : [],
       fulfillment: b.fulfillment || null,
@@ -392,7 +413,7 @@ app.get("/api/execs", requireAuth, async (req, res) => {
 });
 app.post("/api/execs", requireAuth, async (req, res) => {
   const b = req.body || {};
-  try { res.json({ ok: true, exec: await createExec({ name: b.name, phone: b.phone, area: b.area }) }); }
+  try { res.json({ ok: true, exec: await createExec({ name: b.name, phone: normalizePhone(b.phone), area: b.area }) }); }
   catch (err) { console.error("exec create err", err); res.status(500).json({ error: String(err) }); }
 });
 app.post("/api/execs/:id/active", requireAuth, async (req, res) => {
@@ -408,7 +429,7 @@ app.get("/api/customers", requireAuth, async (req, res) => {
 app.post("/api/customers", requireAuth, async (req, res) => {
   const { phone, name, address, note } = req.body || {};
   if (!phone) return res.status(400).json({ error: "phone required" });
-  try { res.json({ ok: true, customer: await createCustomer({ phone, name, address, note }) }); }
+  try { res.json({ ok: true, customer: await createCustomer({ phone: normalizePhone(phone), name, address, note }) }); }
   catch (err) { console.error("customer create err", err); res.status(500).json({ error: String(err) }); }
 });
 // Edit a customer's fields (name/address/note) without touching the phone/history.
