@@ -284,6 +284,7 @@ app.post("/webhook", async (req, res) => {
         }
         for (const s of (v.statuses || [])) {
           await updateStatus(s.id, s.status);
+          if (s.status === "failed") console.error("MSG FAILED ->", s.recipient_id, JSON.stringify(s.errors || s));
         }
       }
     }
