@@ -463,16 +463,19 @@ function shortTime(ts){
 function esc(s){return (s||'').toString().replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
 /* ---------- orders view ---------- */
-const OSTATUSES=['new','dispatched','collected','billed','cancelled'];
+const OSTATUSES=['new','billed_ready','billed_dispatched','cancelled'];
+const OSTATUS_LABELS={new:'new', billed_ready:'billed & ready', billed_dispatched:'billed & dispatched', cancelled:'cancelled'};
 function renderOrders(){
   document.getElementById('app').innerHTML = `
     <div class="orders">
       <div class="bar">
         <h2>📦 Orders</h2>
         <div class="acts">
+          <select id="bulkExec" class="ostatus"><option value="">— delivery staff —</option></select>
+          <button class="mini" onclick="assignExecToSelected()">Assign to ticked</button>
           <button class="mini" onclick="openNewOrder()">+ New order</button>
-          <button class="mini" style="background:#2c6e49" onclick="downloadSelectedOrders()">⬇ Download selected</button>
-          <button class="mini" style="background:#555" onclick="openExecs()">🛵 Delivery staff</button>
+          <button class="mini" style="background:#2c6e49" onclick="downloadSelectedOrders()">⬇ Download</button>
+          <button class="mini" style="background:#555" onclick="openExecs()">🛵 Manage staff</button>
           <button class="linkbtn" onclick="loadOrders()">↻ Refresh</button>
         </div>
       </div>
@@ -488,6 +491,8 @@ async function loadOrders(){
 }
 function renderOrdersTable(){
   const body=document.getElementById('ordersBody'); if(!body) return;
+  const be=document.getElementById('bulkExec');
+  if(be){ const cur=be.value; be.innerHTML='<option value="">— delivery staff —</option>'+EXECS.map(e=>`<option value="${e.id}">${esc(e.name||e.phone)}</option>`).join(''); be.value=cur; }
   if(!ORDERS.length){ body.innerHTML='<div class="empty">No orders yet. Confirmed WhatsApp orders appear here automatically, or add one manually.</div>'; return; }
   body.innerHTML = `<table class="otable"><thead><tr>
     <th><input type="checkbox" onclick="toggleAllOrders(this.checked)"></th>
@@ -496,9 +501,9 @@ function renderOrdersTable(){
       const items=(Array.isArray(o.items)?o.items:[]).map(it=>esc(it.name)+(it.qty?(' – '+esc(it.qty)):'')).join('<br>') || (o.mode==='prescription'?'<i>Prescription</i>':'—');
       const isDelivery=o.fulfillment==='delivery';
       const cancelled=o.status==='cancelled';
-      const execCell = isDelivery ? `<select class="ostatus" onchange="assignExec('${o.id}',this.value)">
+      const execCell = `<select class="ostatus" onchange="assignExec('${o.id}',this.value)">
           <option value="">— assign —</option>${EXECS.map(e=>`<option value="${e.id}" ${String(o.exec_id)===String(e.id)?'selected':''}>${esc(e.name||e.phone)}</option>`).join('')}
-        </select>${o.exec_id?` <button class="mini" onclick="notifyExec('${o.id}')">Send</button>`:''}` : '<span class="sub">—</span>';
+        </select>${o.exec_id?` <button class="mini" onclick="notifyExec('${o.id}')">Send</button>`:''}`;
       return `<tr style="${cancelled?'opacity:.5':''}">
         <td><input type="checkbox" class="ocheck" value="${o.id}"></td>
         <td><span class="ocode" style="cursor:pointer;text-decoration:underline" onclick="openOrderDetail('${o.id}')">${esc(o.order_code||'—')}</span></td>
@@ -506,7 +511,7 @@ function renderOrdersTable(){
         <td><b>${esc(o.customer_name||'—')}</b><br><span class="sub">${esc(o.phone||'')}</span></td>
         <td>${items}</td>
         <td>${isDelivery?'🛵 Delivery':'🏪 Pickup'}${o.address?('<br><span class="sub">'+esc(o.address)+'</span>'):''}</td>
-        <td><select class="ostatus" onchange="setOrderStatus('${o.id}',this.value)">${OSTATUSES.map(s=>`<option ${o.status===s?'selected':''}>${s}</option>`).join('')}</select></td>
+        <td><select class="ostatus" onchange="setOrderStatus('${o.id}',this.value)">${OSTATUSES.map(s=>`<option value="${s}" ${o.status===s?'selected':''}>${OSTATUS_LABELS[s]||s}</option>`).join('')}</select></td>
         <td>${execCell}</td>
         <td style="white-space:nowrap"><button class="mini" onclick="openOrderDetail('${o.id}')">View</button> <button class="mini" style="background:#c0392b" onclick="deleteOrder('${o.id}','${esc(o.order_code||'')}')">Delete</button></td>
       </tr>`;
@@ -567,6 +572,14 @@ async function deleteOrder(id, code){
 }
 async function setOrderStatus(id,status){ try{ await api('/api/orders/'+id+'/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status})}); flash('Status → '+status); const o=ORDERS.find(x=>String(x.id)===String(id)); if(o)o.status=status; }catch(e){} }
 async function assignExec(id,execId){ try{ await api('/api/orders/'+id+'/assign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({execId:execId||null})}); loadOrders(); }catch(e){} }
+async function assignExecToSelected(){
+  const execId=document.getElementById('bulkExec').value;
+  if(!execId){ alert('Pick a delivery staff from the dropdown first.'); return; }
+  const ids=[...document.querySelectorAll('.ocheck:checked')].map(c=>c.value);
+  if(!ids.length){ alert('Tick the orders you want to assign.'); return; }
+  for(const id of ids){ try{ await api('/api/orders/'+id+'/assign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({execId})}); }catch(e){} }
+  flash(`Assigned delivery staff to ${ids.length} order(s)`); loadOrders();
+}
 async function notifyExec(id){ try{ const r=await api('/api/orders/'+id+'/notify-exec',{method:'POST'}); const j=await r.json(); flash(j.ok?'Sent to delivery staff':'Failed: '+(j.error||'')); }catch(e){} }
 
 function openNewOrder(){ document.getElementById('newOrderBg').style.display='flex'; }

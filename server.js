@@ -92,17 +92,24 @@ async function downloadWhatsAppMedia(mediaId) {
   } catch (e) { console.error("downloadWhatsAppMedia err", e); return null; }
 }
 
-// Best-effort customer notification when an order status changes (uses approved
-// templates; silently no-ops/logs if the template isn't approved yet in Meta).
+// Customer + delivery-exec notifications when an order status changes.
+// Uses plain text (works within WhatsApp's 24h service window - covers same-day
+// order/billing). Templates remain available for out-of-window sends later.
 async function notifyOrderStatus(order) {
   try {
-    const name = order.customer_name || "", code = order.order_code || "";
-    let r = null, label = "";
-    if (order.status === "ready" && order.fulfillment !== "delivery") { r = await sendOrderReady(order.wa_id, { name, orderCode: code }); label = "order-ready"; }
-    else if (order.status === "dispatched") { r = await sendOrderDispatched(order.wa_id, { name, orderCode: code }); label = "dispatched"; }
-    else return;
-    if (r?.ok) await addMessage(order.wa_id, { wa_msg_id: r.id, dir: "out", type: "template", body: `[${label}] Order ${code}`, ts: Date.now(), status: "sent", bot: true });
-    else console.warn("notifyOrderStatus not sent (template maybe pending approval):", r?.error);
+    const name = order.customer_name || "there", code = order.order_code || "";
+    const to = order.wa_id || order.phone;
+    if (order.status === "billed_ready") {
+      if (to) await sendWhatsAppText(to, `Hi ${name}, your order ${code} is billed and ready for pickup at Mukesh Medical. Please collect it at your convenience. Thank you. 🙏`, { bot: true });
+    } else if (order.status === "billed_dispatched") {
+      if (to) await sendWhatsAppText(to, `Hi ${name}, your order ${code} has been billed and dispatched for home delivery. Our delivery team will reach you shortly. Thank you. 🙏`, { bot: true });
+      // Notify the assigned delivery executive with the customer's details.
+      if (order.exec_id) {
+        const exec = (await listExecs()).find(e => String(e.id) === String(order.exec_id));
+        if (exec?.phone) await sendWhatsAppText(exec.phone, execHandoffMessage(order, exec), { bot: false });
+        else console.warn("billed_dispatched: assigned exec has no phone", order.exec_id);
+      }
+    }
   } catch (e) { console.error("notifyOrderStatus err", e); }
 }
 
@@ -315,7 +322,7 @@ app.post("/api/orders", requireAuth, async (req, res) => {
 app.post("/api/orders/:id/status", requireAuth, async (req, res) => {
   try {
     const order = await updateOrderStatus(req.params.id, req.body?.status);
-    if (order && order.wa_id) notifyOrderStatus(order).catch(() => {}); // best-effort customer notification
+    if (order) notifyOrderStatus(order).catch(() => {}); // customer + exec notifications
     res.json({ ok: true, order });
   } catch (err) { console.error("order status err", err); res.status(400).json({ error: String(err) }); }
 });

@@ -10,8 +10,10 @@ import { pool } from "./db.js";
 //   new -> ready -> dispatched -> collected|billed
 //   cancelled, partially_fulfilled, returned  (can occur from most states)
 export const ORDER_STATUSES = [
-  "new", "ready", "dispatched", "collected", "billed",
-  "cancelled", "partially_fulfilled", "returned"
+  // Current set used by the dashboard:
+  "new", "cancelled", "billed_ready", "billed_dispatched",
+  // Legacy values kept so old records / API calls still validate:
+  "ready", "dispatched", "collected", "billed", "partially_fulfilled", "returned"
 ];
 
 // ---- Fallback in-memory store (used only when no DATABASE_URL) ----
