@@ -203,13 +203,20 @@ ${detailsBlock}
 === ORDER FLOW (guide the customer through this, one step at a time, do not dump every question at once) ===
 1. If it's a general enquiry (stock, timing, location, etc.), just help - no need to force the order flow.
 2. If the customer wants to order: ONLY ask for the patient's name if we do NOT already have it on file (see CUSTOMER DETAILS ON FILE above). If we have it, use it and move on. When the customer gives a name (or a different patient's name), set the "patientName" field in your JSON to exactly that name. The phone number is captured automatically - never ask for it.
-3. Ask how they'd like to order: type out the medicines, OR send a photo of the prescription.
+3. Ask how they'd like to order: type out the medicines, OR send a photo (either their doctor's prescription, or a clear photo of the medicine/product they want).
 4. If typed: ask them to send each item as "Product name - Quantity" (example: "DOLO 650 - 3 strips"), and record every item they mention into "order.items".
-5. If prescription photo: just acknowledge you've received it and staff will process it. Do not interpret or discuss its contents (see safety rule 2).
+5. If the customer sends a PHOTO, follow the "PHOTOS THE CUSTOMER SENDS" rules below.
 6. Ask whether they want store pickup or home delivery.
 7. If home delivery: ask for their location/area (address). DO NOT mention any delivery charge, fee, or distance at all - our team handles delivery charges separately after the order. If the customer asks about delivery charges, simply say our team will let them know, and do not quote any amount.
 8. Read the full order back to the customer (items, fulfillment method, location if delivery) and explicitly ask them to confirm.
 9. ONLY when the customer clearly confirms that readback: tell them the order is placed and an Order ID will follow shortly (the app generates the real ID - never invent one), and fill the "order" field in your JSON response for that turn with readbackConfirmed:true. On every other turn, "order" must be null.
+
+=== PHOTOS THE CUSTOMER SENDS ===
+When the customer sends a photo, first look at it and decide what it is:
+- A DOCTOR'S PRESCRIPTION (a handwritten or printed medical prescription/Rx from a clinic or hospital, usually with a doctor's name, patient details, and a list of medicines): acknowledge that you've received it and that our staff will process it. Do NOT read out, interpret, list, or name ANY medicine from a prescription (this is safety rule 2). Just confirm receipt warmly.
+- A PRODUCT PHOTO (a photo of a medicine box/strip/bottle, or a health/FMCG product the customer wants to buy): identify the product name (and strength/pack size if clearly visible) from the image, and treat it as an order item. Read it back to confirm, e.g. "I can see DOLO 650 - how many strips would you like?", then continue the order flow and record it in "order.items". If you cannot clearly identify the product, politely ask the customer to type the product name.
+- If the photo is blurry or unclear, ask them to resend a clearer photo.
+Never guess or discuss the contents of a prescription; only identify clearly-visible retail PRODUCTS.
 
 === PERSONALIZATION ===
 ${greet && custName ? `This is the first message of a new session from a returning customer named "${custName}" (their previous inbound message was over 5 hours ago, or this is brand new). Greet them warmly by name once, e.g. "Namaste ${custName}!" style, adapted to their language.` : greet ? `This is the first message of a new session from a new contact. A warm, brief welcome is appropriate, but you do not have a name to use yet - ask for it naturally if relevant to the order flow.` : `This is a CONTINUING conversation, not the start of a new session. Do NOT greet them again or repeat "welcome back" - just respond to what they just said.`}
@@ -280,7 +287,7 @@ Rules for the fields:
 // recent MAX_HISTORY_MESSAGES entries, and merge any accidental consecutive
 // same-role turns (e.g. two outbound messages in a row) into one message so
 // the roles always alternate cleanly.
-function toAnthropicMessages(messages) {
+function toAnthropicMessages(messages, latestImage) {
   const recent = messages.slice(-MAX_HISTORY_MESSAGES);
   const merged = [];
   for (const m of recent) {
@@ -295,7 +302,19 @@ function toAnthropicMessages(messages) {
   }
   // Anthropic requires the array to start with a "user" turn.
   if (merged.length && merged[0].role !== "user") merged.shift();
-  return merged.map((m) => ({ role: m.role, content: m.content }));
+
+  const out = merged.map((m) => ({ role: m.role, content: m.content }));
+  // Attach the just-received photo to the final user turn so the model can see it.
+  if (latestImage?.base64 && out.length) {
+    const lastMsg = out[out.length - 1];
+    if (lastMsg.role === "user") {
+      lastMsg.content = [
+        { type: "image", source: { type: "base64", media_type: latestImage.mime || "image/jpeg", data: latestImage.base64 } },
+        { type: "text", text: typeof lastMsg.content === "string" ? lastMsg.content : "(photo)" }
+      ];
+    }
+  }
+  return out;
 }
 
 // -----------------------------------------------------------------------------
@@ -306,7 +325,9 @@ function toAnthropicMessages(messages) {
 // messages: array oldest->newest of { dir:'in'|'out', text, ts }
 // settings: { trainInstructions } (owner's free-text training)
 // store: { name, hoursText, openHour:10, closeHour:21 }
-export async function mukcareReply({ contact, messages, settings, store, now }) {
+// latestImage (optional): { mime, base64 } for a photo the customer just sent,
+// so MUKCARE can look at it (identify a product, or recognise a prescription).
+export async function mukcareReply({ contact, messages, settings, store, now, latestImage }) {
   const emptyResult = (error = null) => ({
     reply: null,
     lang: null,
@@ -337,7 +358,7 @@ export async function mukcareReply({ contact, messages, settings, store, now }) 
 
     const model = process.env.ANTHROPIC_MODEL || DEFAULT_MODEL;
     const system = buildSystemPrompt({ contact: contact || {}, store: store || {}, settings: settings || {}, now });
-    const anthropicMessages = toAnthropicMessages(messages);
+    const anthropicMessages = toAnthropicMessages(messages, latestImage);
 
     if (anthropicMessages.length === 0) {
       return emptyResult();

@@ -454,7 +454,7 @@ function shortTime(ts){
 function esc(s){return (s||'').toString().replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
 /* ---------- orders view ---------- */
-const OSTATUSES=['new','ready','dispatched','collected','billed','cancelled','partially_fulfilled','returned'];
+const OSTATUSES=['new','dispatched','collected','billed','cancelled'];
 function renderOrders(){
   document.getElementById('app').innerHTML = `
     <div class="orders">

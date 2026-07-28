@@ -114,12 +114,28 @@ async function handleAiReply(waId) {
     if (!convo) return;
     if (convo.humanControl || convo.spam) return;
     const trainInstructions = await getSetting("train_instructions");
+
+    // If the customer's latest message is a photo, load it so MUKCARE can see it
+    // (to identify a product, or recognise a prescription).
+    let latestImage = null;
+    const lastMsg = convo.messages[convo.messages.length - 1];
+    if (lastMsg && lastMsg.type === "image" && lastMsg.mediaId) {
+      try {
+        const media = await getMedia(lastMsg.mediaId);
+        if (media?.data) {
+          const buf = Buffer.isBuffer(media.data) ? media.data : Buffer.from(media.data);
+          if (buf.length <= 4500000) latestImage = { mime: media.mime || "image/jpeg", base64: buf.toString("base64") };
+        }
+      } catch (e) { console.error("load image for AI err", e); }
+    }
+
     const result = await mukcareReply({
       contact: { ...convo, messages: convo.messages },
       messages: convo.messages,
       settings: { trainInstructions },
       store: AI_STORE,
-      now: new Date()
+      now: new Date(),
+      latestImage
     });
     if (result.error) { console.error("MUKCARE error:", result.error); return; }
 
@@ -207,7 +223,7 @@ app.post("/webhook", async (req, res) => {
           if (mediaObj?.id) {
             const dl = await downloadWhatsAppMedia(mediaObj.id);
             if (dl) mediaId = await saveMedia({ waId: m.from, waMsgId: m.id, mime: dl.mime, buffer: dl.buffer });
-            body = m.image ? "[prescription image]" : "[document]";
+            body = m.image ? "[photo]" : "[document]";
           }
           // Marketing opt-out: a bare "STOP" removes them from future campaigns.
           if ((m.text?.body || "").trim().toUpperCase() === "STOP") await recordOptOut(m.from);
@@ -358,6 +374,48 @@ app.get("/media/:id", requireAuth, async (req, res) => {
     res.set("Cache-Control", "private, max-age=86400");
     res.send(Buffer.isBuffer(m.data) ? m.data : Buffer.from(m.data));
   } catch (e) { console.error("media err", e); res.sendStatus(500); }
+});
+
+// ---- One-time: create all MUKCARE message templates via the Graph API ----
+// Far more reliable than the WhatsApp Manager UI. Requires the ACCESS_TOKEN to
+// have whatsapp_business_management permission. Safe to re-run (existing names
+// just return a duplicate error which we report).
+const MUKCARE_TEMPLATE_DEFS = [
+  { name: "order_ready_pickup", category: "UTILITY",
+    body: "Hi {{1}}, your order {{2}} is ready for pickup at Mukesh Medical. Please collect it at your convenience. Thank you.",
+    example: ["Rahul", "MM-260727-001"] },
+  { name: "order_dispatched", category: "UTILITY",
+    body: "Hi {{1}}, your order {{2}} has been dispatched for home delivery. Our delivery team will reach you shortly. Thank you.",
+    example: ["Rahul", "MM-260727-001"] },
+  { name: "order_reminder", category: "UTILITY",
+    body: "Hi {{1}}, a friendly reminder about your order {{2}} with Mukesh Medical. Please reply here if you need any help.",
+    example: ["Rahul", "MM-260727-001"] },
+  { name: "bill_sent", category: "UTILITY",
+    body: "Hi {{1}}, your bill for order {{2}} (Rs. {{3}}) is ready. Thank you for choosing Mukesh Medical.",
+    example: ["Rahul", "MM-260727-001", "450"] },
+  { name: "promo_generic", category: "MARKETING",
+    body: "Hi {{1}}, {{2}} Reply STOP to opt out. - Mukesh Medical",
+    example: ["Rahul", "This week: 15% off on all health supplements!"] },
+];
+
+app.post("/api/admin/create-templates", requireAuth, async (req, res) => {
+  if (!ACCESS_TOKEN || !WABA_ID) return res.status(400).json({ error: "ACCESS_TOKEN and WABA_ID required" });
+  const results = [];
+  for (const t of MUKCARE_TEMPLATE_DEFS) {
+    try {
+      const r = await fetch(`${GRAPH}/${WABA_ID}/message_templates`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: t.name, language: "en", category: t.category,
+          components: [{ type: "BODY", text: t.body, example: { body_text: [t.example] } }]
+        })
+      });
+      const data = await r.json();
+      results.push({ name: t.name, ok: r.ok, status: data.status || (r.ok ? "submitted" : "error"), detail: r.ok ? undefined : (data.error?.message || data) });
+    } catch (e) { results.push({ name: t.name, ok: false, detail: String(e) }); }
+  }
+  res.json({ results });
 });
 
 // ---- Bulk broadcast (marketing templates) ----
