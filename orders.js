@@ -200,6 +200,12 @@ export async function updateOrderStatus(id, status) {
   }
 }
 
+// Permanently delete an order (password-gated in the API route).
+export async function deleteOrder(id) {
+  if (pool) { await pool.query(`DELETE FROM orders WHERE id = $1`, [id]); }
+  else { const i = mem.orders.findIndex(o => o.id === Number(id)); if (i >= 0) mem.orders.splice(i, 1); }
+}
+
 export async function assignExec(orderId, execId) {
   if (pool) {
     const { rows } = await pool.query(

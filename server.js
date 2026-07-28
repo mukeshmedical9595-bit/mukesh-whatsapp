@@ -4,7 +4,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, updateContact, getSetting, setSetting, saveMedia, getMedia, listContacts, createCustomer, deleteContact, getLatestImageMediaId, dbEnabled } from "./db.js";
 import { mukcareReply } from "./ai.js";
-import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, createExec, listExecs, setExecActive, execHandoffMessage } from "./orders.js";
+import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, deleteOrder, createExec, listExecs, setExecActive, execHandoffMessage } from "./orders.js";
 import { sendTemplate, sendOrderReady, sendOrderDispatched, sendOrderReminder, sendBillSent } from "./templates.js";
 import { initCampaignsDb, sendCampaign, recordOptOut } from "./campaigns.js";
 
@@ -23,6 +23,7 @@ let ACCESS_TOKEN     = process.env.ACCESS_TOKEN || "";
 let PHONE_NUMBER_ID  = process.env.PHONE_NUMBER_ID || "";
 let WABA_ID          = process.env.WABA_ID || "";
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "";
+const ORDER_DELETE_PASSWORD = process.env.ORDER_DELETE_PASSWORD || "";
 
 const GRAPH = `https://graph.facebook.com/${GRAPH_VERSION}`;
 
@@ -375,6 +376,15 @@ app.post("/api/customers/:waId/delete", requireAuth, async (req, res) => {
   try { await deleteContact(req.params.waId); res.json({ ok: true }); }
   catch (err) { console.error("customer delete err", err); res.status(500).json({ error: String(err) }); }
 });
+// Delete an order - requires the separate order-delete password.
+app.post("/api/orders/:id/delete", requireAuth, async (req, res) => {
+  const { password } = req.body || {};
+  if (!ORDER_DELETE_PASSWORD) return res.status(400).json({ error: "Order-delete password not configured." });
+  if (password !== ORDER_DELETE_PASSWORD) return res.status(403).json({ error: "wrong password" });
+  try { await deleteOrder(req.params.id); res.json({ ok: true }); }
+  catch (err) { console.error("order delete err", err); res.status(500).json({ error: String(err) }); }
+});
+
 // Full order detail, including the customer's latest prescription image (if any).
 app.get("/api/orders/:id/detail", requireAuth, async (req, res) => {
   try {

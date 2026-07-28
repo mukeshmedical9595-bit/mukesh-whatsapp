@@ -508,7 +508,7 @@ function renderOrdersTable(){
         <td>${isDelivery?'🛵 Delivery':'🏪 Pickup'}${o.address?('<br><span class="sub">'+esc(o.address)+'</span>'):''}</td>
         <td><select class="ostatus" onchange="setOrderStatus('${o.id}',this.value)">${OSTATUSES.map(s=>`<option ${o.status===s?'selected':''}>${s}</option>`).join('')}</select></td>
         <td>${execCell}</td>
-        <td><button class="mini" onclick="openOrderDetail('${o.id}')">View</button></td>
+        <td style="white-space:nowrap"><button class="mini" onclick="openOrderDetail('${o.id}')">View</button> <button class="mini" style="background:#c0392b" onclick="deleteOrder('${o.id}','${esc(o.order_code||'')}')">Delete</button></td>
       </tr>`;
     }).join('')
   }</tbody></table>`;
@@ -554,6 +554,16 @@ async function openOrderDetail(id){
       </div>`;
     if(d.prescriptionMediaId){ try{ const r=await api('/media/'+d.prescriptionMediaId); document.getElementById('odImg').src=URL.createObjectURL(await r.blob()); }catch(e){} }
   }catch(e){ box.innerHTML='Could not load order.'; }
+}
+async function deleteOrder(id, code){
+  const pw=prompt('Enter password to delete order '+code+':');
+  if(!pw) return;
+  try{
+    const r=await api('/api/orders/'+id+'/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+    const j=await r.json().catch(()=>({}));
+    if(r.ok && j.ok){ flash('Order deleted'); loadOrders(); }
+    else alert(j.error==='wrong password' ? 'Wrong password — order not deleted.' : (j.error||'Delete failed'));
+  }catch(e){}
 }
 async function setOrderStatus(id,status){ try{ await api('/api/orders/'+id+'/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status})}); flash('Status → '+status); const o=ORDERS.find(x=>String(x.id)===String(id)); if(o)o.status=status; }catch(e){} }
 async function assignExec(id,execId){ try{ await api('/api/orders/'+id+'/assign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({execId:execId||null})}); loadOrders(); }catch(e){} }
