@@ -92,25 +92,32 @@ async function downloadWhatsAppMedia(mediaId) {
   } catch (e) { console.error("downloadWhatsAppMedia err", e); return null; }
 }
 
-// Customer + delivery-exec notifications when an order status changes.
-// Uses plain text (works within WhatsApp's 24h service window - covers same-day
-// order/billing). Templates remain available for out-of-window sends later.
+// Pickup-ready notification (fired when status becomes billed_ready).
+// Plain text (works within WhatsApp's 24h service window - covers same-day billing).
 async function notifyOrderStatus(order) {
   try {
     const name = order.customer_name || "there", code = order.order_code || "";
     const to = order.wa_id || order.phone;
-    if (order.status === "billed_ready") {
-      if (to) await sendWhatsAppText(to, `Hi ${name}, your order ${code} is billed and ready for pickup at Mukesh Medical. Please collect it at your convenience. Thank you. 🙏`, { bot: true });
-    } else if (order.status === "billed_dispatched") {
-      if (to) await sendWhatsAppText(to, `Hi ${name}, your order ${code} has been billed and dispatched for home delivery. Our delivery team will reach you shortly. Thank you. 🙏`, { bot: true });
-      // Notify the assigned delivery executive with the customer's details.
-      if (order.exec_id) {
-        const exec = (await listExecs()).find(e => String(e.id) === String(order.exec_id));
-        if (exec?.phone) await sendWhatsAppText(exec.phone, execHandoffMessage(order, exec), { bot: false });
-        else console.warn("billed_dispatched: assigned exec has no phone", order.exec_id);
-      }
+    if (order.status === "billed_ready" && to) {
+      await sendWhatsAppText(to, `Hi ${name}, your order ${code} is billed and ready for pickup at Mukesh Medical. Please collect it at your convenience. Thank you. 🙏`, { bot: true });
     }
+    // billed_dispatched notifications are sent when a delivery executive is assigned - see notifyDispatch().
   } catch (e) { console.error("notifyOrderStatus err", e); }
+}
+
+// Dispatch notifications: fired when a delivery executive is assigned to a
+// billed_dispatched order. Messages the customer AND the delivery executive.
+async function notifyDispatch(order) {
+  try {
+    const name = order.customer_name || "there", code = order.order_code || "";
+    const to = order.wa_id || order.phone;
+    if (to) await sendWhatsAppText(to, `Hi ${name}, your order ${code} has been billed and dispatched for home delivery. Our delivery team will reach you shortly. Thank you. 🙏`, { bot: true });
+    if (order.exec_id) {
+      const exec = (await listExecs()).find(e => String(e.id) === String(order.exec_id));
+      if (exec?.phone) await sendWhatsAppText(exec.phone, execHandoffMessage(order, exec), { bot: false });
+      else console.warn("notifyDispatch: assigned exec has no phone", order.exec_id);
+    }
+  } catch (e) { console.error("notifyDispatch err", e); }
 }
 
 // MUKCARE auto-reply. Called from the webhook for each customer who just messaged.
@@ -328,8 +335,12 @@ app.post("/api/orders/:id/status", requireAuth, async (req, res) => {
 });
 
 app.post("/api/orders/:id/assign", requireAuth, async (req, res) => {
-  try { res.json({ ok: true, order: await assignExec(req.params.id, req.body?.execId || null) }); }
-  catch (err) { console.error("order assign err", err); res.status(500).json({ error: String(err) }); }
+  try {
+    const order = await assignExec(req.params.id, req.body?.execId || null);
+    // On assigning a delivery exec to a billed & dispatched order, notify customer + exec.
+    if (order && order.exec_id && order.status === "billed_dispatched") notifyDispatch(order).catch(() => {});
+    res.json({ ok: true, order });
+  } catch (err) { console.error("order assign err", err); res.status(500).json({ error: String(err) }); }
 });
 
 // Send the order details to the assigned delivery executive over WhatsApp.

@@ -501,8 +501,9 @@ function renderOrdersTable(){
       const items=(Array.isArray(o.items)?o.items:[]).map(it=>esc(it.name)+(it.qty?(' – '+esc(it.qty)):'')).join('<br>') || (o.mode==='prescription'?'<i>Prescription</i>':'—');
       const isDelivery=o.fulfillment==='delivery';
       const cancelled=o.status==='cancelled';
-      const execCell = `<select class="ostatus" onchange="assignExec('${o.id}',this.value)">
-          <option value="">— assign —</option>${EXECS.map(e=>`<option value="${e.id}" ${String(o.exec_id)===String(e.id)?'selected':''}>${esc(e.name||e.phone)}</option>`).join('')}
+      const canAssign=o.status==='billed_dispatched';
+      const execCell = `<select class="ostatus" ${canAssign?'':'disabled'} title="${canAssign?'':'Set status to billed & dispatched first'}" onchange="assignExec('${o.id}',this.value)">
+          <option value="">${canAssign?'— assign —':'— set dispatched —'}</option>${EXECS.map(e=>`<option value="${e.id}" ${String(o.exec_id)===String(e.id)?'selected':''}>${esc(e.name||e.phone)}</option>`).join('')}
         </select>${o.exec_id?` <button class="mini" onclick="notifyExec('${o.id}')">Send</button>`:''}`;
       return `<tr style="${cancelled?'opacity:.5':''}">
         <td><input type="checkbox" class="ocheck" value="${o.id}"></td>
@@ -577,8 +578,11 @@ async function assignExecToSelected(){
   if(!execId){ alert('Pick a delivery staff from the dropdown first.'); return; }
   const ids=[...document.querySelectorAll('.ocheck:checked')].map(c=>c.value);
   if(!ids.length){ alert('Tick the orders you want to assign.'); return; }
-  for(const id of ids){ try{ await api('/api/orders/'+id+'/assign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({execId})}); }catch(e){} }
-  flash(`Assigned delivery staff to ${ids.length} order(s)`); loadOrders();
+  const eligible=ids.filter(id=>{ const o=ORDERS.find(x=>String(x.id)===String(id)); return o && o.status==='billed_dispatched'; });
+  if(!eligible.length){ alert('Only orders set to "billed & dispatched" can be assigned a delivery staff. Set their status first.'); return; }
+  for(const id of eligible){ try{ await api('/api/orders/'+id+'/assign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({execId})}); }catch(e){} }
+  const skipped=ids.length-eligible.length;
+  flash(`Assigned to ${eligible.length} order(s)`+(skipped?` (${skipped} skipped — not billed & dispatched)`:'')); loadOrders();
 }
 async function notifyExec(id){ try{ const r=await api('/api/orders/'+id+'/notify-exec',{method:'POST'}); const j=await r.json(); flash(j.ok?'Sent to delivery staff':'Failed: '+(j.error||'')); }catch(e){} }
 
