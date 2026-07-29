@@ -193,6 +193,7 @@ async function handleAiReply(waId) {
       console.log(`MUKCARE -> ${waId}: ${result.reply}${result.buttons?.length ? " [buttons: " + result.buttons.map(b => b.title).join(", ") + "]" : ""}`);
     }
     if (result.suggestBooked) await setContactFlag(waId, "booked", true);
+    if (result.needsHuman) await setContactFlag(waId, "needs_human", true);
 
     // When the customer confirms the order, record it and send the real Order ID.
     if (result.order) {

@@ -5,17 +5,22 @@
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Mukesh Medical — MUKCARE Dashboard</title>
 <style>
-  :root{--g:#128C7E;--gd:#075E54;--bg:#f0f2f5;--in:#fff;--out:#d9fdd3;--bd:#e2e5e9;--muted:#667781}
-  *{box-sizing:border-box;font-family:system-ui,Segoe UI,Roboto,sans-serif}
-  body{margin:0;background:var(--bg);color:#111;height:100vh;overflow:hidden}
-  header{background:var(--gd);color:#fff;padding:10px 18px;display:flex;align-items:center;justify-content:space-between}
-  header h1{font-size:17px;margin:0;font-weight:600}
+  :root{--g:#0e9e88;--gd:#0b6b5e;--accent:#13b8a3;--bg:#eef3f4;--in:#fff;--out:#d9fdd3;--bd:#e5eaec;--muted:#6a7c82;--ink:#12343b}
+  *{box-sizing:border-box;font-family:'Segoe UI',system-ui,Roboto,-apple-system,sans-serif}
+  body{margin:0;background:var(--bg);color:var(--ink);height:100vh;overflow:hidden}
+  header{background:linear-gradient(90deg,var(--gd),var(--g));color:#fff;padding:11px 18px;display:flex;align-items:center;justify-content:space-between;box-shadow:0 2px 10px #0b6b5e33;position:relative;z-index:5}
+  header h1{font-size:17px;margin:0;font-weight:700;letter-spacing:.2px;display:flex;align-items:center;gap:8px}
+  header h1 .rx{background:#fff;color:var(--gd);width:24px;height:24px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center;font-size:15px;font-weight:800}
   header .r{display:flex;align-items:center;gap:12px}
-  .pill{font-size:12px;padding:4px 10px;border-radius:20px;background:#ffffff22}
-  .pill.ok{background:#25D36633}
-  .btn{background:#ffffff22;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;font-size:13px}
-  .btn:hover{background:#ffffff33}
-  .wrap{display:flex;height:calc(100vh - 48px)}
+  .pill{font-size:12px;padding:5px 12px;border-radius:20px;background:#ffffff26;font-weight:500}
+  .pill.ok{background:#7CFFB233;box-shadow:inset 0 0 0 1px #ffffff33}
+  .btn{background:#ffffff26;color:#fff;border:0;border-radius:8px;padding:7px 12px;cursor:pointer;font-size:13px}
+  .btn:hover{background:#ffffff3d}
+  .iconbtn{background:#f0f4f5;border:1px solid var(--bd);border-radius:8px;width:34px;cursor:pointer;font-size:15px;color:var(--g);margin-left:6px}
+  .iconbtn:hover{background:#e4eef0}
+  .search{display:flex;align-items:center}
+  .search input{flex:1}
+  .wrap{display:flex;height:calc(100vh - 50px)}
 
   /* conversation list */
   .list{width:330px;border-right:1px solid var(--bd);display:flex;flex-direction:column;background:#fff}
@@ -37,6 +42,11 @@
   .badge.booked{background:#25D36622;color:#0a7d4b}
   .badge.pause{background:#ffb02033;color:#8a6100}
   .badge.spam{background:#ff4d4d22;color:#b00020}
+  .badge.human{background:#ffe1e1;color:#c11a2b;box-shadow:inset 0 0 0 1px #ffbcbc;animation:humanpulse 1.6s ease-in-out infinite}
+  @keyframes humanpulse{0%,100%{opacity:1}50%{opacity:.55}}
+  .chead-alert{font-size:11px;font-weight:700;color:#c11a2b;background:#ffe1e1;padding:2px 9px;border-radius:10px;margin-left:8px}
+  .alert-human{display:flex;align-items:center;gap:8px;background:#fff2f2;color:#b00020;font-size:13px;padding:9px 16px;border-bottom:1px solid #ffd4d4;border-left:4px solid #e53935}
+  .alert-human .mini{margin-left:auto;font-size:12px;padding:5px 10px;border-radius:7px;cursor:pointer}
 
   /* chat */
   .chat{flex:1;display:flex;flex-direction:column;min-width:0}
@@ -105,11 +115,12 @@
   .orders .bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
   .orders h2{margin:0;font-size:19px}
   .orders .bar .acts{display:flex;gap:8px;align-items:center}
-  .otable{width:100%;border-collapse:collapse;background:#fff;font-size:13px;border:1px solid var(--bd);border-radius:8px;overflow:hidden}
-  .otable th,.otable td{border-bottom:1px solid #eef0f2;padding:9px 11px;text-align:left;vertical-align:top}
-  .otable th{background:#f6f7f9;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:#667781}
+  .otable{width:100%;border-collapse:collapse;background:#fff;font-size:13px;border:1px solid var(--bd);border-radius:10px;overflow:hidden;box-shadow:0 1px 4px #12343b12}
+  .otable th,.otable td{border-bottom:1px solid #eef0f2;padding:10px 12px;text-align:left;vertical-align:top}
+  .otable th{background:linear-gradient(#f4f8f8,#eef3f4);font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--gd)}
+  .otable tr:hover td{background:#f6fbfa}
   .otable tr:last-child td{border-bottom:0}
-  .ocode{font-weight:700;color:#075E54}
+  .ocode{font-weight:700;color:var(--gd)}
   .sub{font-size:11px;color:#667781}
   .ostatus{padding:5px 7px;border:1px solid #ccc;border-radius:6px;font-size:12px;background:#fff}
   .mini{background:var(--g);color:#fff;border:0;border-radius:5px;padding:5px 10px;cursor:pointer;font-size:12px}
@@ -131,7 +142,7 @@
 </head>
 <body>
 <header>
-  <h1>Mukesh Medical · MUKCARE</h1>
+  <h1><span class="rx">℞</span> Mukesh Medical <span style="opacity:.7;font-weight:500">· MUKCARE</span></h1>
   <div class="nav" id="nav" style="display:none">
     <button class="navbtn active" id="nav-chats" onclick="setView('chats')">💬 Chats</button>
     <button class="navbtn" id="nav-orders" onclick="setView('orders')">📦 Orders</button>
@@ -234,8 +245,10 @@ async function boot(){
 function startDashboard(){
   setStatus();
   const nav=document.getElementById('nav'); if(nav && CFG.connected) nav.style.display='flex';
-  if(!CFG.connected){ renderConnect(); }
-  else { view='chats'; renderInbox(); refresh(); setInterval(refresh, 5000); }
+  if(!CFG.connected){ renderConnect(); return; }
+  view='chats'; renderInbox(); refresh();
+  // Auto-refresh ONLY the Orders page (avoids the whole dashboard/chat flickering).
+  if(!window._ordersTick){ window._ordersTick=setInterval(()=>{ if(view==='orders') loadOrders(); }, 7000); }
 }
 
 function setView(v){
@@ -278,7 +291,7 @@ function renderInbox(){
   document.getElementById('app').innerHTML = `
     <div class="wrap">
       <div class="list">
-        <div class="search"><input id="q" placeholder="Search name or number…" oninput="onSearch(this.value)"/></div>
+        <div class="search"><input id="q" placeholder="Search name or number…" oninput="onSearch(this.value)"/><button class="iconbtn" title="Refresh chats" onclick="refresh()">↻</button></div>
         <div class="tabs">
           ${['all','unbooked','booked','spam'].map(t=>`<div class="tab ${filter===t?'active':''}" onclick="setFilter('${t}')">${({all:'All',unbooked:'Not booked',booked:'Booked',spam:'Spam'})[t]}</div>`).join('')}
         </div>
@@ -319,6 +332,7 @@ function renderList(){
       <div class="top"><span class="n">${esc(c.name)}</span><span class="time">${last?shortTime(last.ts):''}</span></div>
       <div class="p">${last?esc(last.dir==='out'?'✓ '+last.text:last.text):''}</div>
       <div class="badges">
+        ${c.needsHuman?'<span class="badge human">🙋 Human required</span>':''}
         ${c.booked?'<span class="badge booked">Booked</span>':''}
         ${c.humanControl?'<span class="badge pause">MUKCARE off</span>':''}
         ${c.spam?'<span class="badge spam">Spam</span>':''}
@@ -327,7 +341,7 @@ function renderList(){
   }).join('') || '<div class="empty">No conversations</div>';
 }
 
-function open_(id){ active=id; renderList(); renderChat(id); renderProfile(id); }
+function open_(id){ active=id; renderChat(id); renderProfile(id); refresh(); }
 
 function msgMeta(m, custName){
   if(m.dir==='in') return { cls:'cust', who: custName || 'Customer' };
@@ -340,7 +354,9 @@ function renderChat(id){
   chat.innerHTML = `
     <div class="chead">
       <div><div class="n">${esc(c.name)}</div><div class="s">+${esc(c.waId)}</div></div>
+      ${c.needsHuman?'<span class="chead-alert">🙋 Human required</span>':''}
     </div>
+    ${c.needsHuman?`<div class="alert-human">🙋 <b>A human is needed on this chat.</b> Please review and reply. <button class="mini" style="background:#fff;color:#b00020;border:1px solid #f3b0b0" onclick="dismissHuman('${c.waId}')">Mark handled</button></div>`:''}
     ${paused?'<div class="banner">🙋 Human control is ON — MUKCARE is paused for this chat. Your replies go directly.</div>':''}
     <div class="msgs" id="msgs">${renderMsgs(c)}</div>
     <div class="composer">
@@ -425,9 +441,13 @@ function renderProfile(id){
 }
 async function flag(id, field, value){
   await api('/api/contact/'+encodeURIComponent(id)+'/flag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({field,value})});
-  if(cache[id]){ cache[id][field==='human_control'?'humanControl':field]=value; }
+  const keyMap={human_control:'humanControl', needs_human:'needsHuman'};
+  if(cache[id]){ cache[id][keyMap[field]||field]=value; }
+  // Taking over the chat (turning MUKCARE off) clears the "human required" alert.
+  if(field==='human_control' && value){ try{ await api('/api/contact/'+encodeURIComponent(id)+'/flag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({field:'needs_human',value:false})}); if(cache[id]) cache[id].needsHuman=false; }catch(e){} }
   renderList(); if(active===id){ renderChat(id); renderProfile(id); }
 }
+async function dismissHuman(id){ try{ await flag(id,'needs_human',false); flash('Marked handled'); }catch(e){} }
 async function saveProfile(id){
   const name=document.getElementById('pname').value.trim();
   const note=document.getElementById('pnote').value;

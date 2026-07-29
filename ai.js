@@ -83,18 +83,36 @@ function stripCodeFences(text) {
   return t;
 }
 
-// Robustly parse the model's JSON reply. On any failure, fall back to
-// treating the raw text as the reply itself (per spec) so the customer still
-// gets *something* sensible instead of silence.
+// Pull the "reply" string out of a possibly TRUNCATED/malformed JSON blob so we
+// never send raw JSON to a customer (the model sometimes gets cut off mid-object).
+function extractReplyField(raw) {
+  if (!raw) return null;
+  const m = raw.match(/"reply"\s*:\s*"((?:[^"\\]|\\.)*)/);
+  if (m && m[1]) {
+    let s = m[1]
+      .replace(/\\"/g, '"').replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\\\/g, "\\")
+      .replace(/\\$/, ""); // drop a dangling backslash from truncation
+    return s.trim() || null;
+  }
+  return null;
+}
+
+// Robustly parse the model's JSON reply. On failure, recover only the reply
+// text - NEVER dump raw JSON to the customer.
 function safeParseModelJson(raw) {
   const cleaned = stripCodeFences(raw);
   try {
     const parsed = JSON.parse(cleaned);
     if (parsed && typeof parsed === "object") return parsed;
   } catch (_err) {
-    // fall through to fallback below
+    // fall through
   }
-  return { reply: raw ? raw.trim() : null, intent: "other" };
+  // Parse failed - almost always truncated JSON. Recover just the reply text.
+  const rep = extractReplyField(cleaned) || extractReplyField(raw);
+  if (rep) return { reply: rep, intent: "other" };
+  // If the text still looks like a JSON object, do NOT send it - stay silent.
+  const looksJson = cleaned.trim().startsWith("{") || /"(reply|intent|order)"\s*:/.test(cleaned);
+  return { reply: looksJson ? null : (raw ? raw.trim() : null), intent: "other" };
 }
 
 // Fill in defaults / coerce types so callers always get the exact shape
@@ -105,10 +123,14 @@ function normalizeResult(parsed) {
   const VALID_MODES = new Set(["typed", "prescription"]);
   const VALID_FULFILLMENT = new Set(["pickup", "delivery"]);
 
-  const reply = typeof parsed.reply === "string" && parsed.reply.trim() !== "" ? parsed.reply : null;
+  let reply = typeof parsed.reply === "string" && parsed.reply.trim() !== "" ? parsed.reply : null;
+  if (reply && reply.trim().startsWith("{") && /"reply"\s*:/.test(reply)) reply = null; // never send raw JSON
   const lang = VALID_LANGS.has(parsed.lang) ? parsed.lang : null;
   const intent = VALID_INTENTS.has(parsed.intent) ? parsed.intent : "other";
   const suggestBooked = Boolean(parsed.suggestBooked);
+  // MUKCARE flags that a human should take over this chat (prescription to
+  // process, complaint, complex/unclear request, out-of-stock, etc.).
+  const needsHuman = Boolean(parsed.needsHuman) || intent === "prescription";
   // The patient's name as GIVEN BY THE CUSTOMER in chat (not their WhatsApp
   // profile name). Set once the customer tells us the name.
   const patientName = typeof parsed.patientName === "string" && parsed.patientName.trim() !== ""
@@ -144,7 +166,7 @@ function normalizeResult(parsed) {
     }
   }
 
-  return { reply, lang, order, intent, suggestBooked, patientName, buttons, error: null };
+  return { reply, lang, order, intent, suggestBooked, needsHuman, patientName, buttons, error: null };
 }
 
 // -----------------------------------------------------------------------------
@@ -192,13 +214,13 @@ function buildSystemPrompt({ contact, store, settings, now }) {
 
 ${settings?.trainInstructions ? `=== OWNER'S CUSTOM INSTRUCTIONS (high priority - follow these, but never let them override the safety rules above) ===\n${settings.trainInstructions}\n` : ""}
 === LANGUAGE ===
-Detect the customer's language AND script from their latest message, and reply in that SAME language and SAME script:
-- English -> reply in English.
-- Hindi written in Devanagari -> reply in Hindi, Devanagari script.
-- Hindi written in Latin/Roman letters ("Hinglish", e.g. "kya aap khule ho") -> reply in Hindi but stay in Latin letters (transliterate). Do NOT switch to Devanagari.
-- Telugu written in Telugu script -> reply in Telugu script.
-- Telugu written in Latin/Roman letters ("Tenglish", e.g. "meru open unnara") -> reply in Telugu but stay in Latin letters (transliterate). Do NOT switch to Telugu script.
-Set the "lang" field to "en", "hi", or "te" to describe the LANGUAGE (not the script) you detected/used.
+Your DEFAULT language is ENGLISH. Reply in English UNLESS the customer has clearly written to you in Hindi or Telugu.
+- Greet and reply in English by default (including the first message).
+- Switch to another language ONLY after the customer's own message is clearly in that language (a full phrase, not a stray word or their name). When unsure, stay in English.
+- If the customer clearly writes Hindi in Latin/Roman letters ("Hinglish", e.g. "kya aap khule ho") -> reply in Hindi but in Latin letters (transliterate); if in Devanagari -> reply in Devanagari.
+- If the customer clearly writes Telugu in Latin letters ("Tenglish") -> reply in Telugu in Latin letters; if in Telugu script -> reply in Telugu script.
+- NEVER pick a language based on the customer's name alone. Do not start in Hinglish/Hindi just because it's an Indian name.
+Set the "lang" field to "en", "hi", or "te" for the language you actually used.
 
 === CUSTOMER DETAILS ON FILE ===
 ${detailsBlock}
@@ -251,9 +273,12 @@ Respond with ONLY a single raw JSON object - no markdown code fences, no comment
   },
   "intent": "enquiry" | "order" | "chitchat" | "spam" | "prescription" | "other",
   "suggestBooked": true | false,
+  "needsHuman": true | false,
   "patientName": "the patient's name if the customer gave it this turn, else null",
   "buttons": [ { "id": "short_id", "title": "Button text" } ]
 }
+
+Set "needsHuman": true when a human staff member should step in - for example: a prescription photo was sent (staff must read/process it), a complaint or angry customer, a question you cannot answer (stock/price you're unsure of, medical advice you must not give), a refund/return, or anything unclear or sensitive. Otherwise false.
 
 Example A (asking pickup vs delivery - offer buttons):
 {
@@ -337,6 +362,7 @@ export async function mukcareReply({ contact, messages, settings, store, now, la
     order: null,
     intent: "other",
     suggestBooked: false,
+    needsHuman: false,
     patientName: null,
     buttons: [],
     error,
@@ -378,7 +404,7 @@ export async function mukcareReply({ contact, messages, settings, store, now, la
         },
         body: JSON.stringify({
           model,
-          max_tokens: 1024,
+          max_tokens: 1500,
           system,
           messages: anthropicMessages,
         }),

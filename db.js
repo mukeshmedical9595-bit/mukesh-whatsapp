@@ -24,6 +24,7 @@ export async function initDb() {
       spam            BOOLEAN NOT NULL DEFAULT FALSE,
       note            TEXT,
       address         TEXT,
+      needs_human     BOOLEAN NOT NULL DEFAULT FALSE,
       last_greeted_at TIMESTAMPTZ,
       created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -32,6 +33,7 @@ export async function initDb() {
     ALTER TABLE contacts ADD COLUMN IF NOT EXISTS spam BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE contacts ADD COLUMN IF NOT EXISTS note TEXT;
     ALTER TABLE contacts ADD COLUMN IF NOT EXISTS address TEXT;
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS needs_human BOOLEAN NOT NULL DEFAULT FALSE;
     CREATE TABLE IF NOT EXISTS messages (
       id         BIGSERIAL PRIMARY KEY,
       wa_msg_id  TEXT UNIQUE,
@@ -82,7 +84,7 @@ export async function upsertContact(waId, name) {
       [waId, name || null]
     );
   } else {
-    const c = mem.contacts[waId] || (mem.contacts[waId] = { wa_id: waId, name: waId, booked: false, human_control: false, spam: false, note: null, address: null, updated: Date.now(), messages: [] });
+    const c = mem.contacts[waId] || (mem.contacts[waId] = { wa_id: waId, name: waId, booked: false, human_control: false, spam: false, note: null, address: null, needs_human: false, updated: Date.now(), messages: [] });
     if (name && (!c.name || c.name === c.wa_id)) c.name = name; // seed only, don't overwrite a set name
   }
 }
@@ -128,7 +130,7 @@ export async function updateStatus(waMsgId, status) {
 export async function getConversations() {
   if (pool) {
     const { rows: cs } = await pool.query(
-      `SELECT wa_id, name, booked, human_control, spam, note, address,
+      `SELECT wa_id, name, booked, human_control, spam, note, address, needs_human,
               EXTRACT(EPOCH FROM created_at)*1000 AS created,
               EXTRACT(EPOCH FROM updated_at)*1000 AS updated
        FROM contacts ORDER BY updated_at DESC`
@@ -149,6 +151,7 @@ export async function getConversations() {
         spam: c.spam,
         note: c.note || "",
         address: c.address || "",
+        needsHuman: c.needs_human,
         created: Number(c.created),
         updated: Number(c.updated),
         messages: ms.map(m => ({ id: m.wa_msg_id, dir: m.dir, type: m.type, text: m.body, ts: Number(m.ts), status: m.status, bot: m.bot, mediaId: m.media_id }))
@@ -158,12 +161,12 @@ export async function getConversations() {
   } else {
     return Object.values(mem.contacts)
       .sort((a, b) => (b.updated || 0) - (a.updated || 0))
-      .map(c => ({ waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", created: c.created || c.updated, updated: c.updated, messages: c.messages }));
+      .map(c => ({ waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "", needsHuman: c.needs_human, created: c.created || c.updated, updated: c.updated, messages: c.messages }));
   }
 }
 
 export async function setContactFlag(waId, field, value) {
-  if (!["booked", "human_control", "spam"].includes(field)) return;
+  if (!["booked", "human_control", "spam", "needs_human"].includes(field)) return;
   if (pool) {
     await pool.query(`UPDATE contacts SET ${field} = $2, updated_at = now() WHERE wa_id = $1`, [waId, value]);
   } else if (mem.contacts[waId]) {
@@ -243,7 +246,7 @@ export async function getConversation(waId) {
   if (!waId) return null;
   if (pool) {
     const { rows: cs } = await pool.query(
-      `SELECT wa_id, name, booked, human_control, spam, note, address FROM contacts WHERE wa_id = $1`,
+      `SELECT wa_id, name, booked, human_control, spam, note, address, needs_human FROM contacts WHERE wa_id = $1`,
       [waId]
     );
     if (!cs[0]) return null;
@@ -255,13 +258,13 @@ export async function getConversation(waId) {
     );
     return {
       waId: c.wa_id, name: c.name || c.wa_id,
-      booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "",
+      booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "", needsHuman: c.needs_human,
       messages: ms.map(m => ({ dir: m.dir, type: m.type, text: m.body, ts: Number(m.ts), status: m.status, bot: m.bot, mediaId: m.media_id }))
     };
   }
   const c = mem.contacts[waId];
   if (!c) return null;
-  return { waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "", messages: c.messages };
+  return { waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "", needsHuman: c.needs_human, messages: c.messages };
 }
 
 // ---- Media (prescription images/documents) ----
