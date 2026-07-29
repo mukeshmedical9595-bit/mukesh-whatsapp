@@ -334,6 +334,7 @@ function renderList(){
       <div class="badges">
         ${c.needsHuman?'<span class="badge human">🙋 Human required</span>':''}
         ${c.booked?'<span class="badge booked">Booked</span>':''}
+        ${(!c.needsHuman && !c.humanControl && c.pausedUntil && c.pausedUntil>Date.now())?'<span class="badge pause">⏸️ MUKCARE paused</span>':''}
         ${c.humanControl?'<span class="badge pause">MUKCARE off</span>':''}
         ${c.spam?'<span class="badge spam">Spam</span>':''}
       </div>
@@ -351,12 +352,15 @@ function msgMeta(m, custName){
 function renderChat(id){
   const c=cache[id]; const chat=document.getElementById('chat'); if(!c||!chat) return;
   const paused=c.humanControl;
+  const autoPaused = c.pausedUntil && c.pausedUntil > Date.now();
+  const resumeTxt = autoPaused ? new Date(c.pausedUntil).toLocaleString('en-IN',{day:'numeric',month:'short',hour:'numeric',minute:'2-digit'}) : '';
   chat.innerHTML = `
     <div class="chead">
       <div><div class="n">${esc(c.name)}</div><div class="s">+${esc(c.waId)}</div></div>
       ${c.needsHuman?'<span class="chead-alert">🙋 Human required</span>':''}
     </div>
-    ${c.needsHuman?`<div class="alert-human">🙋 <b>A human is needed on this chat.</b> Please review and reply. <button class="mini" style="background:#fff;color:#b00020;border:1px solid #f3b0b0" onclick="dismissHuman('${c.waId}')">Mark handled</button></div>`:''}
+    ${c.needsHuman?`<div class="alert-human">🙋 <b>A human is needed on this chat.</b> MUKCARE has stepped back${autoPaused?` and is paused until <b>${resumeTxt}</b>`:''} — please take over and reply. <button class="mini" style="background:#fff;color:#b00020;border:1px solid #f3b0b0" onclick="dismissHuman('${c.waId}')">Mark handled</button></div>`:''}
+    ${(!c.needsHuman && autoPaused)?`<div class="banner">⏸️ MUKCARE is paused for this chat until ${resumeTxt}. Your replies go directly. <a href="#" onclick="dismissHuman('${c.waId}');return false;" style="color:#8a6100;font-weight:600">Resume MUKCARE now</a></div>`:''}
     ${paused?'<div class="banner">🙋 Human control is ON — MUKCARE is paused for this chat. Your replies go directly.</div>':''}
     <div class="msgs" id="msgs">${renderMsgs(c)}</div>
     <div class="composer">
@@ -443,6 +447,8 @@ async function flag(id, field, value){
   await api('/api/contact/'+encodeURIComponent(id)+'/flag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({field,value})});
   const keyMap={human_control:'humanControl', needs_human:'needsHuman'};
   if(cache[id]){ cache[id][keyMap[field]||field]=value; }
+  // Marking handled, or turning MUKCARE's auto-reply back on, lifts the 6h auto-pause.
+  if(cache[id] && ((field==='needs_human'&&!value)||(field==='human_control'&&!value))){ cache[id].pausedUntil=null; }
   // Taking over the chat (turning MUKCARE off) clears the "human required" alert.
   if(field==='human_control' && value){ try{ await api('/api/contact/'+encodeURIComponent(id)+'/flag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({field:'needs_human',value:false})}); if(cache[id]) cache[id].needsHuman=false; }catch(e){} }
   renderList(); if(active===id){ renderChat(id); renderProfile(id); }

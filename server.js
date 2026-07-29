@@ -2,7 +2,7 @@
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
-import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, updateContact, getSetting, setSetting, saveMedia, getMedia, listContacts, createCustomer, deleteContact, getLatestImageMediaId, dbEnabled } from "./db.js";
+import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, setMukcarePause, updateContact, getSetting, setSetting, saveMedia, getMedia, listContacts, createCustomer, deleteContact, getLatestImageMediaId, dbEnabled } from "./db.js";
 import { mukcareReply } from "./ai.js";
 import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, deleteOrder, createExec, listExecs, setExecActive, execHandoffMessage } from "./orders.js";
 import { sendTemplate, sendOrderReady, sendOrderDispatched, sendOrderReminder, sendBillSent, sendDeliveryAssignment } from "./templates.js";
@@ -152,6 +152,12 @@ async function handleAiReply(waId) {
     const convo = await getConversation(waId);
     if (!convo) return;
     if (convo.humanControl || convo.spam) return;
+    // MUKCARE auto-pauses a chat for 6h when it decides a human is needed, so the
+    // staff can take over without the bot interrupting. Resume only after it expires.
+    if (convo.pausedUntil && convo.pausedUntil > Date.now()) {
+      console.log(`MUKCARE paused for ${waId} until ${new Date(convo.pausedUntil).toISOString()} - skipping auto-reply.`);
+      return;
+    }
     const trainInstructions = await getSetting("train_instructions");
 
     // If the customer's latest message is a photo, load it so MUKCARE can see it
@@ -193,7 +199,14 @@ async function handleAiReply(waId) {
       console.log(`MUKCARE -> ${waId}: ${result.reply}${result.buttons?.length ? " [buttons: " + result.buttons.map(b => b.title).join(", ") + "]" : ""}`);
     }
     if (result.suggestBooked) await setContactFlag(waId, "booked", true);
-    if (result.needsHuman) await setContactFlag(waId, "needs_human", true);
+    // MUKCARE decided a human should handle this chat: flag it and pause MUKCARE's
+    // auto-replies for 6 hours so staff can take over and resolve it. After 6h,
+    // if the customer messages again, MUKCARE resumes automatically.
+    if (result.needsHuman) {
+      await setContactFlag(waId, "needs_human", true);
+      await setMukcarePause(waId, Date.now() + 6 * 60 * 60 * 1000);
+      console.log(`MUKCARE paused 6h for ${waId} (human needed).`);
+    }
 
     // When the customer confirms the order, record it and send the real Order ID.
     if (result.order) {
@@ -309,7 +322,15 @@ app.get("/api/messages", requireAuth, async (req, res) => {
 // ---- Toggle booked / human_control / spam on a conversation ----
 app.post("/api/contact/:waId/flag", requireAuth, async (req, res) => {
   const { field, value } = req.body || {};
-  try { await setContactFlag(req.params.waId, field, Boolean(value)); res.json({ ok: true }); }
+  try {
+    await setContactFlag(req.params.waId, field, Boolean(value));
+    // When staff mark the chat handled, or turn MUKCARE's auto-reply back on,
+    // lift any 6-hour auto-pause so MUKCARE can resume on the next message.
+    if ((field === "needs_human" && !value) || (field === "human_control" && !value)) {
+      await setMukcarePause(req.params.waId, null);
+    }
+    res.json({ ok: true });
+  }
   catch (err) { console.error("flag err", err); res.status(500).json({ error: String(err) }); }
 });
 

@@ -25,6 +25,7 @@ export async function initDb() {
       note            TEXT,
       address         TEXT,
       needs_human     BOOLEAN NOT NULL DEFAULT FALSE,
+      mukcare_paused_until TIMESTAMPTZ,
       last_greeted_at TIMESTAMPTZ,
       created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -34,6 +35,7 @@ export async function initDb() {
     ALTER TABLE contacts ADD COLUMN IF NOT EXISTS note TEXT;
     ALTER TABLE contacts ADD COLUMN IF NOT EXISTS address TEXT;
     ALTER TABLE contacts ADD COLUMN IF NOT EXISTS needs_human BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS mukcare_paused_until TIMESTAMPTZ;
     CREATE TABLE IF NOT EXISTS messages (
       id         BIGSERIAL PRIMARY KEY,
       wa_msg_id  TEXT UNIQUE,
@@ -84,7 +86,7 @@ export async function upsertContact(waId, name) {
       [waId, name || null]
     );
   } else {
-    const c = mem.contacts[waId] || (mem.contacts[waId] = { wa_id: waId, name: waId, booked: false, human_control: false, spam: false, note: null, address: null, needs_human: false, updated: Date.now(), messages: [] });
+    const c = mem.contacts[waId] || (mem.contacts[waId] = { wa_id: waId, name: waId, booked: false, human_control: false, spam: false, note: null, address: null, needs_human: false, mukcare_paused_until: null, updated: Date.now(), messages: [] });
     if (name && (!c.name || c.name === c.wa_id)) c.name = name; // seed only, don't overwrite a set name
   }
 }
@@ -131,6 +133,7 @@ export async function getConversations() {
   if (pool) {
     const { rows: cs } = await pool.query(
       `SELECT wa_id, name, booked, human_control, spam, note, address, needs_human,
+              EXTRACT(EPOCH FROM mukcare_paused_until)*1000 AS mukcare_paused_until,
               EXTRACT(EPOCH FROM created_at)*1000 AS created,
               EXTRACT(EPOCH FROM updated_at)*1000 AS updated
        FROM contacts ORDER BY updated_at DESC`
@@ -152,6 +155,7 @@ export async function getConversations() {
         note: c.note || "",
         address: c.address || "",
         needsHuman: c.needs_human,
+        pausedUntil: c.mukcare_paused_until ? Number(c.mukcare_paused_until) : null,
         created: Number(c.created),
         updated: Number(c.updated),
         messages: ms.map(m => ({ id: m.wa_msg_id, dir: m.dir, type: m.type, text: m.body, ts: Number(m.ts), status: m.status, bot: m.bot, mediaId: m.media_id }))
@@ -161,7 +165,7 @@ export async function getConversations() {
   } else {
     return Object.values(mem.contacts)
       .sort((a, b) => (b.updated || 0) - (a.updated || 0))
-      .map(c => ({ waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "", needsHuman: c.needs_human, created: c.created || c.updated, updated: c.updated, messages: c.messages }));
+      .map(c => ({ waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "", needsHuman: c.needs_human, pausedUntil: c.mukcare_paused_until || null, created: c.created || c.updated, updated: c.updated, messages: c.messages }));
   }
 }
 
@@ -171,6 +175,20 @@ export async function setContactFlag(waId, field, value) {
     await pool.query(`UPDATE contacts SET ${field} = $2, updated_at = now() WHERE wa_id = $1`, [waId, value]);
   } else if (mem.contacts[waId]) {
     mem.contacts[waId][field] = value;
+  }
+}
+
+// Pause (or resume) MUKCARE's auto-replies on a single chat.
+// untilMs = epoch ms to pause until, or null to resume immediately.
+export async function setMukcarePause(waId, untilMs) {
+  if (!waId) return;
+  if (pool) {
+    await pool.query(
+      `UPDATE contacts SET mukcare_paused_until = $2, updated_at = now() WHERE wa_id = $1`,
+      [waId, untilMs ? new Date(untilMs).toISOString() : null]
+    );
+  } else if (mem.contacts[waId]) {
+    mem.contacts[waId].mukcare_paused_until = untilMs || null;
   }
 }
 
@@ -246,7 +264,9 @@ export async function getConversation(waId) {
   if (!waId) return null;
   if (pool) {
     const { rows: cs } = await pool.query(
-      `SELECT wa_id, name, booked, human_control, spam, note, address, needs_human FROM contacts WHERE wa_id = $1`,
+      `SELECT wa_id, name, booked, human_control, spam, note, address, needs_human,
+              EXTRACT(EPOCH FROM mukcare_paused_until)*1000 AS mukcare_paused_until
+       FROM contacts WHERE wa_id = $1`,
       [waId]
     );
     if (!cs[0]) return null;
@@ -259,12 +279,13 @@ export async function getConversation(waId) {
     return {
       waId: c.wa_id, name: c.name || c.wa_id,
       booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "", needsHuman: c.needs_human,
+      pausedUntil: c.mukcare_paused_until ? Number(c.mukcare_paused_until) : null,
       messages: ms.map(m => ({ dir: m.dir, type: m.type, text: m.body, ts: Number(m.ts), status: m.status, bot: m.bot, mediaId: m.media_id }))
     };
   }
   const c = mem.contacts[waId];
   if (!c) return null;
-  return { waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "", needsHuman: c.needs_human, messages: c.messages };
+  return { waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "", needsHuman: c.needs_human, pausedUntil: c.mukcare_paused_until || null, messages: c.messages };
 }
 
 // ---- Media (prescription images/documents) ----
