@@ -4,7 +4,8 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, setMukcarePause, updateContact, getSetting, setSetting, getSettings, bumpNonOrderCount, saveMedia, getMedia, listContacts, createCustomer, deleteContact, getLatestImageMediaId, dbEnabled } from "./db.js";
 import { mukcareReply } from "./ai.js";
-import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, deleteOrder, createExec, listExecs, setExecActive, execHandoffMessage } from "./orders.js";
+import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, deleteOrder, createExec, listExecs, setExecActive, execHandoffMessage, getEvents, getOrderItems, setOrderItems, logEvent, setOrderBilling } from "./orders.js";
+import { deliveryQuote } from "./delivery.js";
 import { sendTemplate, sendOrderReady, sendOrderDispatched, sendOrderReminder, sendBillSent, sendDeliveryAssignment } from "./templates.js";
 import { initCampaignsDb, sendCampaign, recordOptOut } from "./campaigns.js";
 import crypto from "crypto";
@@ -40,6 +41,34 @@ function mediaToken(id) {
 }
 function mediaLink(id) {
   return `${PUBLIC_URL}/pub/${id}?t=${mediaToken(id)}`;
+}
+
+// Straight-line distance (km) between two lat/lng points (haversine).
+function haversineKm(lat1, lng1, lat2, lng2) {
+  const R = 6371, toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1), dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return Math.round(2 * R * Math.asin(Math.sqrt(a)) * 100) / 100;
+}
+
+// Settings-driven delivery quote for an order. Uses the outlet lat/lng + the
+// customer's GPS pin (if we have one) to compute distance, then applies the
+// configurable tiers. Returns { distanceKm, fee, pending } - pending=true when
+// we can't compute (no GPS / no outlet), so staff confirm the fee at billing.
+async function computeDeliveryQuote(custLat, custLng, orderValue) {
+  const s = await getSettings(["outlet_lat", "outlet_lng", "free_delivery_radius_km", "free_delivery_order_value", "flat_delivery_charge", "max_delivery_km"]);
+  const oLat = parseFloat(s.outlet_lat), oLng = parseFloat(s.outlet_lng);
+  if (!Number.isFinite(oLat) || !Number.isFinite(oLng) || custLat == null || custLng == null) {
+    return { distanceKm: null, fee: null, pending: true };
+  }
+  const km = haversineKm(oLat, oLng, Number(custLat), Number(custLng));
+  const freeKm = parseFloat(s.free_delivery_radius_km);
+  const freeVal = parseFloat(s.free_delivery_order_value);
+  const flat = parseFloat(s.flat_delivery_charge);
+  if (Number.isFinite(freeVal) && orderValue != null && Number(orderValue) >= freeVal) return { distanceKm: km, fee: 0, pending: false };
+  if (Number.isFinite(freeKm) && km <= freeKm) return { distanceKm: km, fee: 0, pending: false };
+  if (Number.isFinite(flat)) return { distanceKm: km, fee: flat, pending: false };
+  return { distanceKm: km, fee: null, pending: true };
 }
 
 // Verify Meta's webhook payload signature (X-Hub-Signature-256 = HMAC-SHA256 of the
@@ -563,6 +592,44 @@ app.post("/api/orders/:id/assign", requireAuth, async (req, res) => {
   } catch (err) { console.error("order assign err", err); res.status(500).json({ error: String(err) }); }
 });
 
+// Record billing (bill no + amount + optional invoice PDF), move to Billed &
+// Ready / Dispatched, and notify the customer (invoice attached if provided).
+// Manual entry path; the ERP bridge (Block 8) will call this internally later.
+app.post("/api/orders/:id/bill", requireAuth, async (req, res) => {
+  try {
+    const { billNo, orderValue, billMediaId } = req.body || {};
+    const order = await getOrder(req.params.id);
+    if (!order) return res.status(404).json({ error: "order not found" });
+    const isDelivery = order.fulfillment === "delivery";
+
+    // Staff-confirmed delivery distance/fee (if we have the customer's GPS pin).
+    let distanceKm = null, deliveryFee = null, deliveryFeePending = null;
+    if (isDelivery) {
+      const contact = order.wa_id ? await getConversation(order.wa_id).catch(() => null) : null;
+      const q = await computeDeliveryQuote(contact?.locationLat, contact?.locationLng, orderValue);
+      distanceKm = q.distanceKm; deliveryFee = q.fee; deliveryFeePending = q.pending;
+    }
+
+    const billed = await setOrderBilling(req.params.id, {
+      billNo, orderValue: orderValue != null && orderValue !== "" ? Number(orderValue) : null,
+      billMediaId: billMediaId || null, distanceKm, deliveryFee, deliveryFeePending, fulfilment: order.fulfillment
+    });
+
+    // Notify the customer their bill is ready (pickup vs delivery wording), with
+    // the invoice PDF attached when one was uploaded.
+    const to = normalizePhone(order.wa_id || order.phone);
+    if (to) {
+      const name = order.customer_name || "there", code = order.order_code || "";
+      const msg = isDelivery
+        ? `Hi ${name}, your order ${code} is billed and ready for dispatch. Our delivery agent's details will follow shortly. Thank you! 🙏`
+        : `Hi ${name}, your order ${code} is billed and ready for pickup at Mukesh Medical. Thank you! 🙏`;
+      await sendWhatsAppText(to, msg, { bot: true }).catch(() => {});
+      if (billMediaId) await sendWhatsAppDocument(to, { link: mediaLink(billMediaId), filename: `Invoice-${code}.pdf`, caption: `Invoice ${code}` }, { bot: true }).catch(() => {});
+    }
+    res.json({ ok: true, order: billed });
+  } catch (err) { console.error("order bill err", err); res.status(500).json({ error: String(err) }); }
+});
+
 // Send the order details to the assigned delivery executive over WhatsApp.
 app.post("/api/orders/:id/notify-exec", requireAuth, async (req, res) => {
   try {
@@ -629,7 +696,9 @@ app.get("/api/orders/:id/detail", requireAuth, async (req, res) => {
     const order = await getOrder(req.params.id);
     if (!order) return res.status(404).json({ error: "not found" });
     const prescriptionMediaId = order.wa_id ? await getLatestImageMediaId(order.wa_id) : null;
-    res.json({ order, prescriptionMediaId });
+    const events = await getEvents(order.id).catch(() => []);
+    const lineItems = await getOrderItems(order.id).catch(() => []);
+    res.json({ order, prescriptionMediaId, events, lineItems });
   } catch (err) { console.error("order detail err", err); res.status(500).json({ error: String(err) }); }
 });
 

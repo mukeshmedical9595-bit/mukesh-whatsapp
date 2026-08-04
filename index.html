@@ -237,7 +237,7 @@
 
 <script>
 let CFG=null, active=null, cache={}, filter='all', search='', view='chats';
-let ORDERS=[], EXECS=[];
+let ORDERS=[], EXECS=[], ORDER_TAB='all';
 let DASH_KEY = localStorage.getItem('mm_dash_key') || '';
 
 // Authenticated fetch for /api/* routes: attaches the dashboard password header.
@@ -540,9 +540,13 @@ function renderOrders(){
           <button class="linkbtn" onclick="loadOrders()">↻ Refresh</button>
         </div>
       </div>
+      <div class="tabs" style="border:0;padding:0 0 12px">
+        ${['all','pickup','delivery'].map(t=>`<div class="tab ${ORDER_TAB===t?'active':''}" onclick="setOrderTab('${t}')">${({all:'All',pickup:'🏪 Pickup',delivery:'🛵 Delivery'})[t]}</div>`).join('')}
+      </div>
       <div id="ordersBody"><div class="empty">Loading…</div></div>
     </div>`;
 }
+function setOrderTab(t){ ORDER_TAB=t; renderOrders(); renderOrdersTable(); }
 async function loadOrders(){
   try{
     const d=await (await api('/api/orders')).json();
@@ -550,35 +554,50 @@ async function loadOrders(){
     renderOrdersTable();
   }catch(e){}
 }
+function orderRowHtml(o){
+  const items=(Array.isArray(o.items)?o.items:[]).map(it=>esc(it.name)+(it.qty?(' – '+esc(it.qty)):'')).join('<br>') || (o.mode==='prescription'?'<i>Prescription</i>':'—');
+  const isDelivery=o.fulfillment==='delivery';
+  const cancelled=o.status==='cancelled';
+  const canAssign=o.status==='billed_dispatched';
+  const execCell = isDelivery ? `<select class="ostatus" ${canAssign?'':'disabled'} title="${canAssign?'':'Set status to billed & dispatched first'}" onchange="assignExec('${o.id}',this.value)">
+      <option value="">${canAssign?'— assign —':'— set dispatched —'}</option>${EXECS.map(e=>`<option value="${e.id}" ${String(o.exec_id)===String(e.id)?'selected':''}>${esc(e.name||e.phone)}</option>`).join('')}
+    </select>${o.exec_id?` <button class="mini" onclick="notifyExec('${o.id}')">Send</button>`:''}` : '<span class="sub">—</span>';
+  return `<tr style="${cancelled?'opacity:.5':''}">
+    <td><input type="checkbox" class="ocheck" value="${o.id}"></td>
+    <td><span class="ocode" style="cursor:pointer;text-decoration:underline" onclick="openOrderDetail('${o.id}')">${esc(o.order_code||'—')}</span>${o.order_value!=null?`<br><span class="sub">₹${esc(o.order_value)}</span>`:''}</td>
+    <td class="sub">${new Date(o.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</td>
+    <td><b>${esc(o.customer_name||'—')}</b><br><span class="sub">${esc(o.phone||'')}</span></td>
+    <td>${items}</td>
+    <td>${isDelivery?'🛵 Delivery':'🏪 Pickup'}${o.address?('<br><span class="sub">'+esc(o.address)+'</span>'):''}</td>
+    <td><select class="ostatus" onchange="setOrderStatus('${o.id}',this.value)">${OSTATUSES.map(s=>`<option value="${s}" ${o.status===s?'selected':''}>${OSTATUS_LABELS[s]||s}</option>`).join('')}</select></td>
+    <td>${execCell}</td>
+    <td style="white-space:nowrap"><button class="mini" onclick="openOrderDetail('${o.id}')">View</button> <button class="mini" style="background:#c0392b" onclick="deleteOrder('${o.id}','${esc(o.order_code||'')}')">Delete</button></td>
+  </tr>`;
+}
+function dayLabel(ts){
+  const d=new Date(ts), t=new Date(), y=new Date(Date.now()-864e5);
+  if(d.toDateString()===t.toDateString()) return 'Today';
+  if(d.toDateString()===y.toDateString()) return 'Yesterday';
+  return d.toLocaleDateString([],{weekday:'short',day:'numeric',month:'short',year:'numeric'});
+}
 function renderOrdersTable(){
   const body=document.getElementById('ordersBody'); if(!body) return;
   const be=document.getElementById('bulkExec');
   if(be){ const cur=be.value; be.innerHTML='<option value="">— delivery staff —</option>'+EXECS.map(e=>`<option value="${e.id}">${esc(e.name||e.phone)}</option>`).join(''); be.value=cur; }
-  if(!ORDERS.length){ body.innerHTML='<div class="empty">No orders yet. Confirmed WhatsApp orders appear here automatically, or add one manually.</div>'; return; }
-  body.innerHTML = `<table class="otable"><thead><tr>
+  let list=ORDERS.slice();
+  if(ORDER_TAB==='pickup') list=list.filter(o=>o.fulfillment!=='delivery');
+  else if(ORDER_TAB==='delivery') list=list.filter(o=>o.fulfillment==='delivery');
+  if(!list.length){ body.innerHTML='<div class="empty">No orders in this view.</div>'; return; }
+  // Group by day (orders already come newest-first).
+  const groups=[]; const seen={};
+  list.forEach(o=>{ const k=new Date(o.created_at).toDateString(); if(!seen[k]){ seen[k]=[]; groups.push({k,ts:o.created_at,rows:seen[k]}); } seen[k].push(o); });
+  const head=`<thead><tr>
     <th><input type="checkbox" onclick="toggleAllOrders(this.checked)"></th>
-    <th>Order ID</th><th>When</th><th>Customer</th><th>Items</th><th>Fulfilment</th><th>Status</th><th>Delivery staff</th><th></th></tr></thead><tbody>${
-    ORDERS.map(o=>{
-      const items=(Array.isArray(o.items)?o.items:[]).map(it=>esc(it.name)+(it.qty?(' – '+esc(it.qty)):'')).join('<br>') || (o.mode==='prescription'?'<i>Prescription</i>':'—');
-      const isDelivery=o.fulfillment==='delivery';
-      const cancelled=o.status==='cancelled';
-      const canAssign=o.status==='billed_dispatched';
-      const execCell = `<select class="ostatus" ${canAssign?'':'disabled'} title="${canAssign?'':'Set status to billed & dispatched first'}" onchange="assignExec('${o.id}',this.value)">
-          <option value="">${canAssign?'— assign —':'— set dispatched —'}</option>${EXECS.map(e=>`<option value="${e.id}" ${String(o.exec_id)===String(e.id)?'selected':''}>${esc(e.name||e.phone)}</option>`).join('')}
-        </select>${o.exec_id?` <button class="mini" onclick="notifyExec('${o.id}')">Send</button>`:''}`;
-      return `<tr style="${cancelled?'opacity:.5':''}">
-        <td><input type="checkbox" class="ocheck" value="${o.id}"></td>
-        <td><span class="ocode" style="cursor:pointer;text-decoration:underline" onclick="openOrderDetail('${o.id}')">${esc(o.order_code||'—')}</span></td>
-        <td class="sub">${new Date(o.created_at).toLocaleString()}</td>
-        <td><b>${esc(o.customer_name||'—')}</b><br><span class="sub">${esc(o.phone||'')}</span></td>
-        <td>${items}</td>
-        <td>${isDelivery?'🛵 Delivery':'🏪 Pickup'}${o.address?('<br><span class="sub">'+esc(o.address)+'</span>'):''}</td>
-        <td><select class="ostatus" onchange="setOrderStatus('${o.id}',this.value)">${OSTATUSES.map(s=>`<option value="${s}" ${o.status===s?'selected':''}>${OSTATUS_LABELS[s]||s}</option>`).join('')}</select></td>
-        <td>${execCell}</td>
-        <td style="white-space:nowrap"><button class="mini" onclick="openOrderDetail('${o.id}')">View</button> <button class="mini" style="background:#c0392b" onclick="deleteOrder('${o.id}','${esc(o.order_code||'')}')">Delete</button></td>
-      </tr>`;
-    }).join('')
-  }</tbody></table>`;
+    <th>Order ID</th><th>Time</th><th>Customer</th><th>Items</th><th>Fulfilment</th><th>Status</th><th>Delivery staff</th><th></th></tr></thead>`;
+  body.innerHTML = groups.map(g=>`
+    <div style="font-weight:700;color:var(--gd);margin:16px 0 6px;font-size:13px">${dayLabel(g.ts)} <span class="sub" style="font-weight:400">· ${g.rows.length} order${g.rows.length>1?'s':''}</span></div>
+    <table class="otable">${head}<tbody>${g.rows.map(orderRowHtml).join('')}</tbody></table>
+  `).join('');
 }
 function toggleAllOrders(checked){ document.querySelectorAll('.ocheck').forEach(c=>c.checked=checked); }
 function csvCell(v){ v=(v==null?'':String(v)).replace(/"/g,'""'); return `"${v}"`; }
@@ -607,6 +626,21 @@ async function openOrderDetail(id){
     const items=(Array.isArray(o.items)?o.items:[]).map(it=>`<li>${esc(it.name)}${it.qty?(' – '+esc(it.qty)):''}</li>`).join('') || (o.mode==='prescription'?'<i>Prescription order (see image below)</i>':'—');
     let img='';
     if(d.prescriptionMediaId){ img=`<div style="margin-top:10px"><b>Prescription / photo sent by customer:</b><br><img id="odImg" style="max-width:100%;border-radius:8px;margin-top:6px;background:#eee;min-height:40px"/></div>`; }
+    const events=d.events||[];
+    const timeline = events.length ? `<div style="margin-top:12px"><b>Activity timeline:</b>
+      <div style="margin-top:6px;border-left:2px solid var(--bd);padding-left:12px">${events.map(e=>`
+        <div style="margin-bottom:8px"><div style="font-size:13px">${esc(e.detail||'')}</div><div class="sub">${new Date(e.ts).toLocaleString()}</div></div>`).join('')}
+      </div></div>` : '';
+    const billed = o.status && o.status!=='new' && o.status!=='cancelled';
+    const billForm = (o.status==='new') ? `
+      <div style="margin-top:14px;padding:12px;border:1px solid var(--bd);border-radius:8px;background:#f8fbfb">
+        <b>💵 Bill & notify customer</b>
+        <div class="rowf" style="margin-top:8px"><input id="billNo" placeholder="Bill / invoice no"/><input id="billAmt" placeholder="Order value ₹" type="number"/></div>
+        <label class="sub" style="display:block;margin:6px 0 2px">Invoice PDF (optional — sent to customer)</label>
+        <input type="file" id="billPdf" accept="application/pdf,image/*"/>
+        <div style="margin-top:10px"><button class="ok" onclick="billOrder('${o.id}','${o.fulfillment==='delivery'?'delivery':'pickup'}')">Bill & notify</button></div>
+        <div class="sub" style="margin-top:6px">${o.fulfillment==='delivery'?'Moves to “Billed & dispatched”, sends the customer a ready-for-dispatch message.':'Moves to “Billed & ready”, sends the customer a ready-for-pickup message.'}</div>
+      </div>` : '';
     box.innerHTML=`
       <div style="font-size:14px;line-height:1.7">
         <div><b>Order ID:</b> <span class="ocode">${esc(o.order_code||'—')}</span></div>
@@ -614,9 +648,14 @@ async function openOrderDetail(id){
         <div><b>Customer:</b> ${esc(o.customer_name||'—')} (${esc(o.phone||'')})</div>
         <div><b>Fulfilment:</b> ${o.fulfillment==='delivery'?'🛵 Home delivery':'🏪 Store pickup'}</div>
         ${o.address?`<div><b>Address:</b> ${esc(o.address)}</div>`:''}
-        <div><b>Status:</b> ${esc(o.status||'')}</div>
+        <div><b>Status:</b> ${esc(OSTATUS_LABELS[o.status]||o.status||'')}</div>
+        ${o.bill_no?`<div><b>Bill no:</b> ${esc(o.bill_no)}</div>`:''}
+        ${o.order_value!=null?`<div><b>Order value:</b> ₹${esc(o.order_value)}</div>`:''}
+        ${(o.fulfillment==='delivery'&&o.distance_km!=null)?`<div><b>Distance:</b> ${esc(o.distance_km)} km${o.delivery_fee!=null?` · fee ₹${esc(o.delivery_fee)}`:''}${o.delivery_fee_pending?' (staff to confirm)':''}</div>`:''}
         <div style="margin-top:6px"><b>Items:</b><ul style="margin:4px 0 0 18px">${items}</ul></div>
         ${o.notes?`<div style="margin-top:6px"><b>Notes:</b> ${esc(o.notes)}</div>`:''}
+        ${billForm}
+        ${timeline}
         ${img}
       </div>`;
     if(d.prescriptionMediaId){ try{ const r=await api('/media/'+d.prescriptionMediaId); document.getElementById('odImg').src=URL.createObjectURL(await r.blob()); }catch(e){} }
@@ -633,6 +672,24 @@ async function deleteOrder(id, code){
   }catch(e){}
 }
 async function setOrderStatus(id,status){ try{ await api('/api/orders/'+id+'/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status})}); flash('Status → '+(OSTATUS_LABELS[status]||status)); loadOrders(); }catch(e){} }
+async function billOrder(id, fulfilment){
+  const billNo=(document.getElementById('billNo')?.value||'').trim();
+  const amt=(document.getElementById('billAmt')?.value||'').trim();
+  const fileEl=document.getElementById('billPdf'); const file=fileEl&&fileEl.files&&fileEl.files[0];
+  flash('Billing…');
+  let billMediaId=null;
+  if(file){
+    try{
+      const dataUrl=await new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result);r.onerror=rej;r.readAsDataURL(file);});
+      const up=await (await api('/api/media',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataUrl})})).json();
+      billMediaId=up.id||null;
+    }catch(e){}
+  }
+  try{
+    await api('/api/orders/'+id+'/bill',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({billNo,orderValue:amt,billMediaId})});
+    flash('Billed & customer notified'); closeModal('orderDetailBg'); loadOrders();
+  }catch(e){ flash('Billing failed'); }
+}
 async function assignExec(id,execId){ try{ await api('/api/orders/'+id+'/assign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({execId:execId||null})}); loadOrders(); }catch(e){} }
 async function assignExecToSelected(){
   const execId=document.getElementById('bulkExec').value;

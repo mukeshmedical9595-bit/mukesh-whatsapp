@@ -403,6 +403,45 @@ export async function assignExec(orderId, execId) {
   }
 }
 
+// Record billing: bill number, order value, optional invoice media, and
+// staff-confirmed delivery distance/fee. Moves the order to 'billed_ready'
+// (pickup) or 'billed_dispatched' (delivery) and stamps ready_at.
+export async function setOrderBilling(id, { billNo, orderValue, billMediaId, distanceKm, deliveryFee, deliveryFeePending, fulfilment } = {}) {
+  const targetStatus = fulfilment === "delivery" ? "billed_dispatched" : "billed_ready";
+  if (pool) {
+    await pool.query(
+      `UPDATE orders SET
+         bill_no = COALESCE($2, bill_no),
+         order_value = COALESCE($3, order_value),
+         bill_media_id = COALESCE($4, bill_media_id),
+         distance_km = COALESCE($5, distance_km),
+         delivery_fee = COALESCE($6, delivery_fee),
+         delivery_fee_pending = COALESCE($7, delivery_fee_pending),
+         status = $8,
+         ready_at = CASE WHEN ready_at IS NULL THEN now() ELSE ready_at END,
+         updated_at = now()
+       WHERE id = $1`,
+      [id, billNo ?? null, orderValue ?? null, billMediaId ?? null, distanceKm ?? null,
+       deliveryFee ?? null, deliveryFeePending ?? null, targetStatus]
+    );
+  } else {
+    const o = mem.orders.find(o => o.id === Number(id));
+    if (o) {
+      if (billNo != null) o.bill_no = billNo;
+      if (orderValue != null) o.order_value = orderValue;
+      if (billMediaId != null) o.bill_media_id = billMediaId;
+      if (distanceKm != null) o.distance_km = distanceKm;
+      if (deliveryFee != null) o.delivery_fee = deliveryFee;
+      if (deliveryFeePending != null) o.delivery_fee_pending = deliveryFeePending;
+      o.status = targetStatus;
+      if (!o.ready_at) o.ready_at = new Date();
+      o.updated_at = new Date();
+    }
+  }
+  await logEvent(id, "status", `Billed (${billNo || "no bill#"}${orderValue != null ? ", ₹" + orderValue : ""}) → ${targetStatus}`);
+  return getOrder(id);
+}
+
 // Business rule: editing an order does NOT mutate it in place. Instead the
 // old order_code is cancelled and a brand-new order_code is issued, carrying
 // over the original fields with the requested changes applied. This keeps a
