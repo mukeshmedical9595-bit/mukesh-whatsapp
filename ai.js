@@ -471,3 +471,30 @@ export async function mukcareReply({ contact, messages, settings, store, now, la
     return emptyResult(String(err));
   }
 }
+
+// Lightweight, fire-and-forget classifier: is a customer message actual FEEDBACK
+// about their experience, and if so what sentiment? Ignores order requests,
+// greetings, prescriptions, and questions. Returns { isFeedback, sentiment }.
+export async function classifyFeedback(text) {
+  const none = { isFeedback: false, sentiment: "neutral" };
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey || !text || !String(text).trim()) return none;
+  const system = `You classify a single WhatsApp message sent to a pharmacy. Decide if it is FEEDBACK about the customer's experience/service/delivery/staff (praise, thanks-for-good-service, or a complaint), NOT an order, greeting, question, price ask, or prescription. Reply with ONLY raw JSON: {"isFeedback": true|false, "sentiment": "positive"|"neutral"|"negative"}. If it isn't feedback, isFeedback=false.`;
+  try {
+    const res = await fetch(ANTHROPIC_URL, {
+      method: "POST",
+      headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: process.env.ANTHROPIC_MODEL || DEFAULT_MODEL,
+        max_tokens: 60, system,
+        messages: [{ role: "user", content: String(text).slice(0, 1000) }],
+      }),
+    });
+    if (!res.ok) return none;
+    const data = await res.json();
+    const raw = Array.isArray(data.content) ? data.content.map(b => b?.text || "").join("").trim() : "";
+    const p = safeParseModelJson(raw);
+    const sentiment = ["positive", "neutral", "negative"].includes(p.sentiment) ? p.sentiment : "neutral";
+    return { isFeedback: Boolean(p.isFeedback), sentiment };
+  } catch { return none; }
+}

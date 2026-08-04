@@ -162,6 +162,8 @@
   <div class="nav" id="nav" style="display:none">
     <button class="navbtn active" id="nav-chats" onclick="setView('chats')">💬 Chats</button>
     <button class="navbtn" id="nav-orders" onclick="setView('orders')">📦 Orders</button>
+    <button class="navbtn" id="nav-place" onclick="setView('place')">🧾 Place Orders</button>
+    <button class="navbtn" id="nav-feedback" onclick="setView('feedback')">⭐ Feedback</button>
     <button class="navbtn" id="nav-customers" onclick="setView('customers')">👥 Customers</button>
     <button class="navbtn" id="nav-broadcast" onclick="setView('broadcast')">📣 Broadcast</button>
     <button class="navbtn" id="nav-train" onclick="setView('train')">🎓 Train</button>
@@ -270,9 +272,11 @@ function startDashboard(){
 
 function setView(v){
   view=v;
-  ['chats','orders','customers','broadcast','train','settings'].forEach(x=>{ const b=document.getElementById('nav-'+x); if(b) b.classList.toggle('active', v===x); });
+  ['chats','orders','place','feedback','customers','broadcast','train','settings'].forEach(x=>{ const b=document.getElementById('nav-'+x); if(b) b.classList.toggle('active', v===x); });
   if(v==='chats'){ renderInbox(); renderList(); if(active){ renderChat(active); renderProfile(active); } }
   else if(v==='orders'){ renderOrders(); loadOrders(); }
+  else if(v==='place'){ renderPlace(); loadPlace(); }
+  else if(v==='feedback'){ renderFeedback(); loadFeedback(); }
   else if(v==='customers'){ renderCustomers(); loadCustomers(); }
   else if(v==='broadcast'){ renderBroadcast(); }
   else if(v==='train'){ renderTrain(); }
@@ -939,6 +943,115 @@ async function saveSettings(){
     outletAddress:g('s_addr'), discountText:g('s_disc') };
   try{ await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); flash('Settings saved'); }catch(e){ flash('Save failed'); }
 }
+
+/* ---------- place orders (procurement) ---------- */
+let PLACE=null, PLACE_TAB='pending';
+function renderPlace(){
+  document.getElementById('app').innerHTML = `
+    <div class="orders">
+      <div class="bar">
+        <h2>🧾 Place Orders</h2>
+        <div class="acts">
+          <button class="mini" style="background:#2c6e49" onclick="exportPlace()">⬇ Export</button>
+          <button class="linkbtn" onclick="loadPlace()">↻ Refresh</button>
+        </div>
+      </div>
+      <div class="tabs" style="border:0;padding:0 0 12px">
+        ${['pending','available','placed'].map(t=>`<div class="tab ${PLACE_TAB===t?'active':''}" onclick="setPlaceTab('${t}')">${({pending:'To place',available:'Available',placed:'Already placed'})[t]}</div>`).join('')}
+      </div>
+      <div id="placeBody"><div class="empty">Loading…</div></div>
+    </div>`;
+}
+function setPlaceTab(t){ PLACE_TAB=t; renderPlace(); renderPlaceBody(); }
+async function loadPlace(){ try{ PLACE=await (await api('/api/place-orders')).json(); renderPlaceBody(); }catch(e){} }
+function renderPlaceBody(){
+  const body=document.getElementById('placeBody'); if(!body||!PLACE) return;
+  if(PLACE_TAB==='placed'){
+    const lines=PLACE.placed||[];
+    if(!lines.length){ body.innerHTML='<div class="empty">No vendor-locked lines yet.</div>'; return; }
+    body.innerHTML=`<table class="otable"><thead><tr><th>Product</th><th>Qty placed</th><th>Vendor</th><th>Placed</th><th></th></tr></thead><tbody>${
+      lines.map(l=>`<tr>
+        <td><b>${esc(l.product_name)}</b></td>
+        <td>${esc(l.qty_placed)}</td>
+        <td><input type="text" value="${esc(l.vendor||'')}" placeholder="vendor" style="padding:5px 8px;border:1px solid var(--bd);border-radius:6px" onchange="editVendor('${l.id}',this.value)"/></td>
+        <td class="sub">${new Date(l.placed_at).toLocaleString()}</td>
+        <td><button class="mini" style="background:#c0392b" onclick="undoLine('${l.id}')">Undo</button></td>
+      </tr>`).join('')
+    }</tbody></table>`;
+    return;
+  }
+  const rows = PLACE_TAB==='pending' ? (PLACE.pending||[]) : (PLACE.available||[]);
+  if(!rows.length){ body.innerHTML=`<div class="empty">${PLACE_TAB==='pending'?'Nothing to place — all demand is covered.':'No products fully covered by stock yet.'}</div>`; return; }
+  body.innerHTML=`<table class="otable"><thead><tr><th>Product</th><th>Ordered</th><th>In stock</th><th>Placed</th><th>To place</th>${PLACE_TAB==='pending'?'<th>Vendor / lock</th>':''}<th></th></tr></thead><tbody>${
+    rows.map((r,i)=>`<tr>
+      <td><b>${esc(r.product_name)}</b><br><span class="sub" style="cursor:pointer" onclick="togglePlaceRow(${i})">${r.contributing.length} order(s) ▾</span>
+        <div id="pc_${i}" style="display:none;margin-top:4px">${r.contributing.map(c=>`<div class="sub">${esc(c.orderCode||'')} · ${esc(c.customer)} · ${esc(c.qty)}</div>`).join('')}</div>
+      </td>
+      <td>${esc(r.total_ordered)}</td>
+      <td>${esc(r.in_stock)}</td>
+      <td>${esc(r.already_placed)}</td>
+      <td><b>${esc(r.to_place)}</b></td>
+      ${PLACE_TAB==='pending'?`<td><input type="text" id="v_${i}" placeholder="vendor" style="padding:5px 8px;border:1px solid var(--bd);border-radius:6px;width:120px"/> <button class="mini" onclick="lockProduct('${esc(r.product_norm)}',${i})">Lock</button></td>`:''}
+      <td>${PLACE_TAB==='pending'?'<span class="badge pause">To place</span>':'<span class="badge booked">Available</span>'}</td>
+    </tr>`).join('')
+  }</tbody></table>`;
+}
+function togglePlaceRow(i){ const e=document.getElementById('pc_'+i); if(e) e.style.display=e.style.display==='none'?'block':'none'; }
+async function lockProduct(norm,i){
+  const vendor=(document.getElementById('v_'+i)?.value||'').trim();
+  if(!vendor && !confirm('Lock this line without a vendor?')) return;
+  try{ await api('/api/place-orders/lock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({productNorm:norm,vendor})}); flash('Locked'); loadPlace(); }catch(e){ flash('Lock failed'); }
+}
+async function editVendor(id,vendor){ try{ await api('/api/place-orders/line/'+id+'/vendor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vendor})}); flash('Vendor updated'); }catch(e){} }
+async function undoLine(id){ if(!confirm('Undo this placed line? Its demand returns to “To place”.'))return; try{ await api('/api/place-orders/line/'+id+'/delete',{method:'POST'}); flash('Undone'); loadPlace(); }catch(e){} }
+function exportPlace(){
+  if(!PLACE) return;
+  const rows=[['Product','Ordered','In stock','Already placed','To place','Status','Vendor']];
+  (PLACE.pending||[]).forEach(r=>rows.push([r.product_name,r.total_ordered,r.in_stock,r.already_placed,r.to_place,'To place','']));
+  (PLACE.available||[]).forEach(r=>rows.push([r.product_name,r.total_ordered,r.in_stock,r.already_placed,r.to_place,'Available','']));
+  (PLACE.placed||[]).forEach(l=>rows.push([l.product_name,l.total_ordered,l.stock_used,l.qty_placed,0,'Placed',l.vendor||'']));
+  const csv=rows.map(r=>r.map(csvCell).join(',')).join('\r\n');
+  const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+  a.download=`mukesh-place-orders-${new Date().toISOString().slice(0,10)}.csv`; document.body.appendChild(a); a.click(); a.remove();
+  flash('Exported');
+}
+
+/* ---------- feedback ---------- */
+let FB=null, FB_FILTER='all';
+function renderFeedback(){
+  document.getElementById('app').innerHTML = `
+    <div class="orders">
+      <div class="bar"><h2>⭐ Feedback</h2><div class="acts"><button class="linkbtn" onclick="loadFeedback()">↻ Refresh</button></div></div>
+      <div class="tabs" id="fbTabs" style="border:0;padding:0 0 12px"></div>
+      <div id="fbBody"><div class="empty">Loading…</div></div>
+    </div>`;
+}
+async function loadFeedback(){ try{ FB=await (await api('/api/feedback?filter='+FB_FILTER)).json(); renderFeedbackBody(); }catch(e){} }
+function setFbFilter(f){ FB_FILTER=f; loadFeedback(); }
+function renderFeedbackBody(){
+  const tabs=document.getElementById('fbTabs'); const body=document.getElementById('fbBody'); if(!body||!FB) return;
+  const c=FB.counts||{};
+  if(tabs) tabs.innerHTML=['all','negative','positive'].map(t=>{
+    const badge=(t==='negative'&&c.unhandledNegative)?` <span class="badge spam">${c.unhandledNegative}</span>`:'';
+    return `<div class="tab ${FB_FILTER===t?'active':''}" onclick="setFbFilter('${t}')">${({all:'All',negative:'Negative',positive:'Positive'})[t]}${badge}</div>`;
+  }).join('');
+  const items=FB.items||[];
+  if(!items.length){ body.innerHTML='<div class="empty">No feedback yet. It’s captured automatically from customer messages after orders.</div>'; return; }
+  const chip=s=>({positive:'<span class="badge booked">😊 Positive</span>',negative:'<span class="badge spam">😞 Negative</span>',neutral:'<span class="badge pause">😐 Neutral</span>'})[s]||s;
+  body.innerHTML=items.map(f=>`
+    <div class="card" style="background:#fff;border:1px solid var(--bd);border-radius:10px;padding:12px 14px;margin-bottom:10px;${f.sentiment==='negative'&&!f.handled?'border-left:4px solid #e53935':''}">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div>${chip(f.sentiment)} <span class="sub">${new Date(f.ts).toLocaleString()}</span></div>
+        <div>
+          ${f.wa_id?`<button class="mini" onclick="setView('chats');setTimeout(()=>open_('${f.wa_id}'),200)">Open chat</button> `:''}
+          ${f.handled?'<span class="sub">✓ handled</span>':`<button class="mini" style="background:#2c6e49" onclick="handleFb('${f.id}')">Mark handled</button>`}
+        </div>
+      </div>
+      <div style="margin-top:6px;font-size:14px">${esc(f.text||'')}</div>
+      ${f.wa_id?`<div class="sub" style="margin-top:2px">${esc(f.wa_id)}</div>`:''}
+    </div>`).join('');
+}
+async function handleFb(id){ try{ await api('/api/feedback/'+id+'/handled',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({handled:true})}); flash('Marked handled'); loadFeedback(); }catch(e){} }
 
 /* ---------- broadcast (bulk promo) ---------- */
 let BC_RECIPIENTS=[];

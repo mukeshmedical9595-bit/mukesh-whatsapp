@@ -3,8 +3,8 @@ import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, setMukcarePause, updateContact, getSetting, setSetting, getSettings, bumpNonOrderCount, saveMedia, getMedia, listContacts, createCustomer, deleteContact, getLatestImageMediaId, dbEnabled } from "./db.js";
-import { mukcareReply } from "./ai.js";
-import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, deleteOrder, createExec, listExecs, setExecActive, execHandoffMessage, getEvents, getOrderItems, setOrderItems, logEvent, setOrderBilling } from "./orders.js";
+import { mukcareReply, classifyFeedback } from "./ai.js";
+import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, deleteOrder, createExec, listExecs, setExecActive, execHandoffMessage, getEvents, getOrderItems, setOrderItems, logEvent, setOrderBilling, getProcurement, lockProcurement, editProcurementVendor, deleteProcurementLine, addFeedback, listFeedback, feedbackCounts, markFeedbackHandled, ordersNeedingFeedbackRequest, markFeedbackRequested } from "./orders.js";
 import { sendTemplate, sendOrderReady, sendOrderDispatched, sendOrderReminder, sendBillSent, sendDeliveryAssignment } from "./templates.js";
 import { initCampaignsDb, sendCampaign, recordOptOut } from "./campaigns.js";
 import crypto from "crypto";
@@ -405,6 +405,7 @@ app.post("/webhook", async (req, res) => {
   if (!verifyWebhookSignature(req)) { console.warn("Webhook signature invalid - ignoring."); return res.sendStatus(401); }
   res.sendStatus(200); // ack fast
   const aiTargets = new Set();
+  const feedbackCandidates = []; // [waId, text] for new inbound text messages
   try {
     for (const e of (req.body.entry || [])) {
       for (const ch of (e.changes || [])) {
@@ -438,6 +439,7 @@ app.post("/webhook", async (req, res) => {
           console.log(`IN  ${m.from}: ${body}`);
           if (inserted) {
             aiTargets.add(m.from); // only reply to genuinely new messages
+            if (m.type === "text" && m.text?.body) feedbackCandidates.push([m.from, m.text.body]);
             // Mark the chat unread and pull it back out of the archive so staff see it.
             try { await updateContact(m.from, { unread: true, archived: false }); } catch (e) {}
           }
@@ -457,8 +459,25 @@ app.post("/webhook", async (req, res) => {
     }
     // After persisting inbound messages, let MUKCARE reply to each customer.
     for (const t of aiTargets) await handleAiReply(t);
+    // Fire-and-forget: classify new inbound TEXT for feedback/sentiment.
+    for (const [waId, text] of feedbackCandidates) classifyAndRecordFeedback(waId, text).catch(() => {});
   } catch (err) { console.error("webhook err", err); }
 });
+
+// Classify a customer message for feedback; record it, and flag negative
+// feedback's chat as needs-human + unread so staff follow up. Never throws.
+async function classifyAndRecordFeedback(waId, text) {
+  try {
+    const c = await classifyFeedback(text);
+    if (!c.isFeedback) return;
+    await addFeedback({ waId, sentiment: c.sentiment, text });
+    if (c.sentiment === "negative") {
+      await setContactFlag(waId, "needs_human", true);
+      await updateContact(waId, { unread: true });
+      console.log(`NEGATIVE feedback from ${waId} - flagged needs-human.`);
+    }
+  } catch (e) { /* best-effort */ }
+}
 
 // ---- List conversations ----
 app.get("/api/messages", requireAuth, async (req, res) => {
@@ -628,6 +647,58 @@ app.post("/api/orders/:id/bill", requireAuth, async (req, res) => {
     res.json({ ok: true, order: billed });
   } catch (err) { console.error("order bill err", err); res.status(500).json({ error: String(err) }); }
 });
+
+// ---- Procurement (Place Orders) ----
+app.get("/api/place-orders", requireAuth, async (req, res) => {
+  try { res.json(await getProcurement()); }
+  catch (err) { console.error("place-orders err", err); res.status(500).json({ error: String(err) }); }
+});
+app.post("/api/place-orders/lock", requireAuth, async (req, res) => {
+  try {
+    const { productNorm, vendor } = req.body || {};
+    const line = await lockProcurement(productNorm, vendor);
+    res.json({ ok: true, line });
+  } catch (err) { console.error("lock err", err); res.status(400).json({ error: String(err) }); }
+});
+app.post("/api/place-orders/line/:id/vendor", requireAuth, async (req, res) => {
+  try { await editProcurementVendor(req.params.id, req.body?.vendor); res.json({ ok: true }); }
+  catch (err) { res.status(500).json({ error: String(err) }); }
+});
+app.post("/api/place-orders/line/:id/delete", requireAuth, async (req, res) => {
+  try { await deleteProcurementLine(req.params.id); res.json({ ok: true }); }
+  catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+// ---- Feedback ----
+app.get("/api/feedback", requireAuth, async (req, res) => {
+  try {
+    sweepFeedbackRequests().catch(() => {}); // opportunistic sweep while dashboard is open
+    res.json({ items: await listFeedback(req.query.filter || "all"), counts: await feedbackCounts() });
+  } catch (err) { console.error("feedback list err", err); res.status(500).json({ error: String(err) }); }
+});
+app.post("/api/feedback/:id/handled", requireAuth, async (req, res) => {
+  try { await markFeedbackHandled(req.params.id, req.body?.handled !== false); res.json({ ok: true }); }
+  catch (err) { res.status(500).json({ error: String(err) }); }
+});
+
+// Post-order feedback sweep: a few hours after an order became ready/dispatched,
+// ask the customer how it went - but only inside WhatsApp's 24h window.
+let _fbSweeping = false;
+async function sweepFeedbackRequests() {
+  if (_fbSweeping) return; _fbSweeping = true;
+  try {
+    const due = await ordersNeedingFeedbackRequest(180);
+    for (const o of due) {
+      const to = normalizePhone(o.wa_id || o.phone);
+      if (!to) { await markFeedbackRequested(o.id); continue; }
+      if (!(await within24hWindow(to))) { continue; } // wait; try again later within window
+      const name = o.customer_name || "there";
+      await sendWhatsAppText(to, `Hi ${name}, thank you for choosing Mukesh Medical! How was your experience with order ${o.order_code}? Your feedback helps us serve you better. 🙏`, { bot: true }).catch(() => {});
+      await markFeedbackRequested(o.id);
+      console.log(`Feedback request sent for ${o.order_code}`);
+    }
+  } finally { _fbSweeping = false; }
+}
 
 // Send the order details to the assigned delivery executive over WhatsApp.
 app.post("/api/orders/:id/notify-exec", requireAuth, async (req, res) => {
@@ -884,5 +955,7 @@ app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
   app.listen(PORT, async () => {
     console.log(`Mukesh Medical app listening on :${PORT} (persistent=${dbEnabled})`);
     console.log("autoWire:", JSON.stringify(await autoWire()));
+    // Post-order feedback sweep every 30 min (also runs when the Feedback tab loads).
+    setInterval(() => { sweepFeedbackRequests().catch(() => {}); }, 30 * 60 * 1000);
   });
 })();

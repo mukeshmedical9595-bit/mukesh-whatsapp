@@ -562,3 +562,142 @@ export function execHandoffMessage(order, exec) {
 
   return lines.join("\n");
 }
+
+// ---- Procurement: aggregate demand across orders, subtract stock/placed ----
+// Normalise a product name for matching (uppercase, collapse spaces/punctuation).
+export function normalizeProductName(name) {
+  return String(name || "").toUpperCase().replace(/[^A-Z0-9]+/g, " ").trim();
+}
+// Parse a leading quantity number out of free text ("3 strips" -> 3, "" -> 1).
+function parseQty(text) {
+  const m = String(text ?? "").match(/(\d+(?:\.\d+)?)/);
+  return m ? Number(m[1]) : 1;
+}
+
+// Read all procurement_lines (vendor-locked batches).
+export async function listProcurementLines() {
+  if (pool) {
+    const { rows } = await pool.query(`SELECT * FROM procurement_lines ORDER BY placed_at DESC`);
+    return rows;
+  }
+  return mem.procurement.slice().sort((a, b) => b.placed_at - a.placed_at);
+}
+
+// Build the procurement view: aggregate demand from active orders per product,
+// subtract what's already vendor-locked, and split into pending / available.
+// stock: optional { productNorm: qtyInStock } map (from ERP later); defaults to {}.
+export async function getProcurement(stock = {}) {
+  const active = (await listOrders({ limit: 100000 })).filter(
+    o => !o.deleted && ["new", "billed_ready", "billed_dispatched"].includes(o.status)
+  );
+  const agg = {}; // norm -> { product_name, totalOrdered, contributing:[] }
+  for (const o of active) {
+    const items = Array.isArray(o.items) ? o.items : [];
+    for (const it of items) {
+      if (!it || !it.name) continue;
+      const norm = normalizeProductName(it.name);
+      if (!norm) continue;
+      const q = parseQty(it.qty);
+      if (!agg[norm]) agg[norm] = { product_norm: norm, product_name: it.name, total_ordered: 0, contributing: [] };
+      agg[norm].total_ordered += q;
+      agg[norm].contributing.push({ orderId: o.id, orderCode: o.order_code, customer: o.customer_name || o.phone || "-", qty: it.qty || String(q) });
+    }
+  }
+  // Subtract already-placed (vendor-locked) quantities.
+  const lines = await listProcurementLines();
+  const placedByNorm = {};
+  for (const l of lines) placedByNorm[l.product_norm] = (placedByNorm[l.product_norm] || 0) + Number(l.qty_placed || 0);
+
+  const pending = [], available = [];
+  for (const norm of Object.keys(agg)) {
+    const a = agg[norm];
+    const inStock = Number(stock[norm] || 0);
+    const alreadyPlaced = placedByNorm[norm] || 0;
+    const toPlace = a.total_ordered - inStock - alreadyPlaced;
+    const row = { ...a, in_stock: inStock, already_placed: alreadyPlaced, to_place: Math.max(0, toPlace) };
+    if (toPlace > 0) pending.push(row); else available.push(row);
+  }
+  pending.sort((x, y) => y.to_place - x.to_place);
+  return { pending, available, placed: lines };
+}
+
+// Vendor-lock a product: freeze the current "to place" quantity into a
+// procurement_line tagged with the vendor + the contributing orders snapshot.
+export async function lockProcurement(productNorm, vendor, stock = {}) {
+  const { pending } = await getProcurement(stock);
+  const row = pending.find(p => p.product_norm === productNorm);
+  if (!row) throw new Error("nothing to place for this product");
+  const contributing = JSON.stringify(row.contributing || []);
+  if (pool) {
+    const { rows } = await pool.query(
+      `INSERT INTO procurement_lines (product_norm, product_name, qty_placed, stock_used, total_ordered, vendor, contributing)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [row.product_norm, row.product_name, row.to_place, row.in_stock, row.total_ordered, vendor || null, contributing]
+    );
+    return rows[0];
+  }
+  const line = { id: mem.nextSeq++, product_norm: row.product_norm, product_name: row.product_name,
+    qty_placed: row.to_place, stock_used: row.in_stock, total_ordered: row.total_ordered,
+    vendor: vendor || null, contributing: row.contributing || [], placed_at: new Date() };
+  mem.procurement.push(line);
+  return line;
+}
+
+export async function editProcurementVendor(id, vendor) {
+  if (pool) { await pool.query(`UPDATE procurement_lines SET vendor = $2 WHERE id = $1`, [id, vendor || null]); }
+  else { const l = mem.procurement.find(l => l.id === Number(id)); if (l) l.vendor = vendor || null; }
+}
+
+export async function deleteProcurementLine(id) {
+  if (pool) { await pool.query(`DELETE FROM procurement_lines WHERE id = $1`, [id]); }
+  else { const i = mem.procurement.findIndex(l => l.id === Number(id)); if (i >= 0) mem.procurement.splice(i, 1); }
+}
+
+// ---- Feedback ----
+export async function addFeedback({ waId, orderId, sentiment, text }) {
+  if (pool) {
+    const { rows } = await pool.query(
+      `INSERT INTO feedback (wa_id, order_id, sentiment, text) VALUES ($1,$2,$3,$4) RETURNING *`,
+      [waId || null, orderId || null, sentiment || "neutral", text || null]
+    );
+    return rows[0];
+  }
+  const row = { id: mem.nextSeq++, wa_id: waId || null, order_id: orderId || null, sentiment: sentiment || "neutral", text: text || null, handled: false, created_at: new Date() };
+  mem.feedback.push(row);
+  return row;
+}
+export async function listFeedback(filter = "all") {
+  let rows;
+  if (pool) { rows = (await pool.query(`SELECT id, wa_id, order_id, sentiment, text, handled, EXTRACT(EPOCH FROM created_at)*1000 AS ts FROM feedback ORDER BY created_at DESC`)).rows.map(r => ({ ...r, ts: Number(r.ts) })); }
+  else { rows = mem.feedback.slice().sort((a, b) => b.created_at - a.created_at).map(r => ({ ...r, ts: +r.created_at })); }
+  if (filter === "positive") rows = rows.filter(r => r.sentiment === "positive");
+  else if (filter === "negative") rows = rows.filter(r => r.sentiment === "negative");
+  return rows;
+}
+export async function feedbackCounts() {
+  const all = await listFeedback("all");
+  return {
+    total: all.length,
+    positive: all.filter(r => r.sentiment === "positive").length,
+    negative: all.filter(r => r.sentiment === "negative").length,
+    unhandledNegative: all.filter(r => r.sentiment === "negative" && !r.handled).length,
+  };
+}
+export async function markFeedbackHandled(id, handled = true) {
+  if (pool) { await pool.query(`UPDATE feedback SET handled = $2 WHERE id = $1`, [id, Boolean(handled)]); }
+  else { const f = mem.feedback.find(f => f.id === Number(id)); if (f) f.handled = Boolean(handled); }
+}
+
+// Orders that became ready/dispatched >delayMin minutes ago and haven't had a
+// feedback request sent yet - drives the post-order feedback sweep.
+export async function ordersNeedingFeedbackRequest(delayMin = 180) {
+  const cutoff = Date.now() - delayMin * 60 * 1000;
+  const all = await listOrders({ limit: 100000 });
+  return all.filter(o => !o.feedback_requested && !o.deleted
+    && ["billed_ready", "billed_dispatched"].includes(o.status)
+    && o.ready_at && new Date(o.ready_at).getTime() <= cutoff);
+}
+export async function markFeedbackRequested(orderId) {
+  if (pool) { await pool.query(`UPDATE orders SET feedback_requested = TRUE WHERE id = $1`, [orderId]); }
+  else { const o = mem.orders.find(o => o.id === Number(orderId)); if (o) o.feedback_requested = true; }
+}
