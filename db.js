@@ -36,6 +36,19 @@ export async function initDb() {
     ALTER TABLE contacts ADD COLUMN IF NOT EXISTS address TEXT;
     ALTER TABLE contacts ADD COLUMN IF NOT EXISTS needs_human BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE contacts ADD COLUMN IF NOT EXISTS mukcare_paused_until TIMESTAMPTZ;
+    -- KYC / location / list-management fields (idempotent, safe to re-run).
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS name_confirmed  BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS wa_profile_name TEXT;
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS location_lat    DOUBLE PRECISION;
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS location_lng    DOUBLE PRECISION;
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS alternate_number TEXT;
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS default_patient TEXT;
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS archived        BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS unread          BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS non_order_count INT NOT NULL DEFAULT 0;
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS source          TEXT NOT NULL DEFAULT 'whatsapp';
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS consent_whatsapp BOOLEAN NOT NULL DEFAULT TRUE;
+    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS deleted         BOOLEAN NOT NULL DEFAULT FALSE;
     CREATE TABLE IF NOT EXISTS messages (
       id         BIGSERIAL PRIMARY KEY,
       wa_msg_id  TEXT UNIQUE,
@@ -86,7 +99,7 @@ export async function upsertContact(waId, name) {
       [waId, name || null]
     );
   } else {
-    const c = mem.contacts[waId] || (mem.contacts[waId] = { wa_id: waId, name: waId, booked: false, human_control: false, spam: false, note: null, address: null, needs_human: false, mukcare_paused_until: null, updated: Date.now(), messages: [] });
+    const c = mem.contacts[waId] || (mem.contacts[waId] = { wa_id: waId, name: waId, booked: false, human_control: false, spam: false, note: null, address: null, needs_human: false, mukcare_paused_until: null, name_confirmed: false, wa_profile_name: null, location_lat: null, location_lng: null, alternate_number: null, default_patient: null, archived: false, unread: false, non_order_count: 0, source: "whatsapp", consent_whatsapp: true, deleted: false, updated: Date.now(), messages: [] });
     if (name && (!c.name || c.name === c.wa_id)) c.name = name; // seed only, don't overwrite a set name
   }
 }

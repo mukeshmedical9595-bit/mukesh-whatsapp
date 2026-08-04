@@ -20,8 +20,15 @@ export const ORDER_STATUSES = [
 const mem = {
   orders: [],   // rows, same shape as Postgres rows
   execs: [],
+  events: [],       // { id, order_id, kind, detail, created_at }
+  orderItems: [],   // { id, order_id, ... }
+  procurement: [],  // procurement_lines
+  feedback: [],     // feedback rows
+  prescriptions: [],
+  learning: [],
   nextOrderId: 1,
   nextExecId: 1,
+  nextSeq: 1,
 };
 
 function todayStamp(d = new Date()) {
@@ -72,6 +79,96 @@ export async function initOrders() {
     CREATE INDEX IF NOT EXISTS idx_orders_wa_id ON orders(wa_id);
     CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
     CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at);
+
+    -- Billing / delivery / lifecycle fields added as the system grew.
+    -- All idempotent so this is safe to re-run on every boot.
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS patient_name         TEXT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_value          NUMERIC;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS bill_no              TEXT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS bill_media_id        BIGINT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS ready_at             TIMESTAMPTZ;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS feedback_requested   BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_fee_pending BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_lat         DOUBLE PRECISION;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_lng         DOUBLE PRECISION;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS days_supply          INT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS rx_note              TEXT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS incomplete           BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS needs_review         BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS deleted              BOOLEAN NOT NULL DEFAULT FALSE;
+
+    -- Per-line order items (in addition to the legacy JSONB orders.items column,
+    -- which is kept for backward compatibility). New code should prefer this table.
+    CREATE TABLE IF NOT EXISTS order_items (
+      id               BIGSERIAL PRIMARY KEY,
+      order_id         BIGINT REFERENCES orders(id) ON DELETE CASCADE,
+      name             TEXT,
+      pack             TEXT,
+      quantity         TEXT,
+      dosage           TEXT,
+      duration         TEXT,
+      calc_note        TEXT,
+      duration_missing BOOLEAN NOT NULL DEFAULT FALSE,
+      not_required     BOOLEAN NOT NULL DEFAULT FALSE,
+      placed_line_id   BIGINT,
+      created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);
+
+    -- Audit timeline: one row per lifecycle event (status change, note, message).
+    CREATE TABLE IF NOT EXISTS order_events (
+      id         BIGSERIAL PRIMARY KEY,
+      order_id   BIGINT REFERENCES orders(id) ON DELETE CASCADE,
+      kind       TEXT,          -- 'status' | 'message' | 'system'
+      detail     TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_order_events_order ON order_events(order_id);
+
+    -- Procurement: vendor-locked purchase batches aggregated across orders.
+    CREATE TABLE IF NOT EXISTS procurement_lines (
+      id            BIGSERIAL PRIMARY KEY,
+      product_norm  TEXT,
+      product_name  TEXT,
+      qty_placed    NUMERIC,
+      stock_used    NUMERIC,
+      total_ordered NUMERIC,
+      vendor        TEXT,
+      contributing  JSONB,
+      placed_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    -- Customer feedback captured after an order, with AI sentiment.
+    CREATE TABLE IF NOT EXISTS feedback (
+      id         BIGSERIAL PRIMARY KEY,
+      wa_id      TEXT,
+      order_id   BIGINT,
+      sentiment  TEXT,          -- 'positive' | 'neutral' | 'negative'
+      text       TEXT,
+      handled    BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_feedback_handled ON feedback(handled);
+
+    -- Uploaded prescription / product images + the AI's draft reading (staff-only).
+    CREATE TABLE IF NOT EXISTS prescriptions (
+      id         BIGSERIAL PRIMARY KEY,
+      wa_id      TEXT,
+      order_id   BIGINT,
+      media_id   BIGINT,
+      kind       TEXT,          -- 'prescription'|'product_photo'|'document'|'unclear'
+      draft      JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    -- Verified prescription readings that improve future vision reads.
+    CREATE TABLE IF NOT EXISTS learning_examples (
+      id         BIGSERIAL PRIMARY KEY,
+      kind       TEXT,
+      input      TEXT,
+      verified   JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
   `);
   console.log("Orders/execs schema ready (Postgres).");
 }
@@ -122,6 +219,7 @@ export async function createOrder(data) {
         data.notes || null,
       ]
     );
+    await logEvent(rows[0].id, "status", `Order created (${status})`);
     return rows[0];
   } else {
     const row = {
@@ -140,12 +238,84 @@ export async function createOrder(data) {
       status,
       exec_id: data.execId || null,
       notes: data.notes || null,
+      order_value: data.orderValue ?? null,
+      bill_no: data.billNo ?? null,
+      bill_media_id: data.billMediaId ?? null,
+      ready_at: null,
+      feedback_requested: false,
+      delivery_fee_pending: data.deliveryFeePending ?? false,
+      delivery_lat: data.deliveryLat ?? null,
+      delivery_lng: data.deliveryLng ?? null,
+      days_supply: data.daysSupply ?? null,
+      patient_name: data.patientName ?? null,
+      deleted: false,
       created_at: new Date(),
       updated_at: new Date(),
     };
     mem.orders.push(row);
+    await logEvent(row.id, "status", `Order created (${status})`);
     return row;
   }
+}
+
+// ---- Order event timeline ----
+export async function logEvent(orderId, kind, detail) {
+  if (!orderId) return;
+  if (pool) {
+    await pool.query(
+      `INSERT INTO order_events (order_id, kind, detail) VALUES ($1,$2,$3)`,
+      [orderId, kind || "system", detail || ""]
+    );
+  } else {
+    mem.events.push({ id: mem.nextSeq++, order_id: Number(orderId), kind: kind || "system", detail: detail || "", created_at: new Date() });
+  }
+}
+
+export async function getEvents(orderId) {
+  if (pool) {
+    const { rows } = await pool.query(
+      `SELECT id, kind, detail, EXTRACT(EPOCH FROM created_at)*1000 AS ts
+       FROM order_events WHERE order_id = $1 ORDER BY created_at ASC`,
+      [orderId]
+    );
+    return rows.map(r => ({ id: r.id, kind: r.kind, detail: r.detail, ts: Number(r.ts) }));
+  }
+  return mem.events.filter(e => e.order_id === Number(orderId))
+    .sort((a, b) => a.created_at - b.created_at)
+    .map(e => ({ id: e.id, kind: e.kind, detail: e.detail, ts: +e.created_at }));
+}
+
+// ---- Per-line order items (new table; JSONB orders.items still kept in sync) ----
+export async function setOrderItems(orderId, items = []) {
+  if (!orderId) return;
+  if (pool) {
+    await pool.query(`DELETE FROM order_items WHERE order_id = $1`, [orderId]);
+    for (const it of items) {
+      await pool.query(
+        `INSERT INTO order_items (order_id, name, pack, quantity, dosage, duration, calc_note, duration_missing, not_required)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [orderId, it.name || null, it.pack || null, it.quantity ?? it.qty ?? null,
+         it.dosage || null, it.duration || null, it.calc_note || null,
+         Boolean(it.duration_missing), Boolean(it.not_required)]
+      );
+    }
+  } else {
+    mem.orderItems = mem.orderItems.filter(i => i.order_id !== Number(orderId));
+    for (const it of items) {
+      mem.orderItems.push({ id: mem.nextSeq++, order_id: Number(orderId), name: it.name || null,
+        pack: it.pack || null, quantity: it.quantity ?? it.qty ?? null, dosage: it.dosage || null,
+        duration: it.duration || null, calc_note: it.calc_note || null,
+        duration_missing: Boolean(it.duration_missing), not_required: Boolean(it.not_required) });
+    }
+  }
+}
+
+export async function getOrderItems(orderId) {
+  if (pool) {
+    const { rows } = await pool.query(`SELECT * FROM order_items WHERE order_id = $1 ORDER BY id ASC`, [orderId]);
+    return rows;
+  }
+  return mem.orderItems.filter(i => i.order_id === Number(orderId));
 }
 
 // filter: { status, waId, execId, limit, offset } - all optional
@@ -187,17 +357,24 @@ export async function updateOrderStatus(id, status) {
   if (!ORDER_STATUSES.includes(status)) {
     throw new Error(`Invalid order status: ${status}`);
   }
+  // Stamp ready_at when an order becomes ready/dispatched (drives feedback sweep + SLA).
+  const stampReady = (status === "billed_ready" || status === "billed_dispatched");
   if (pool) {
     const { rows } = await pool.query(
-      `UPDATE orders SET status = $2, updated_at = now() WHERE id = $1 RETURNING *`,
-      [id, status]
+      `UPDATE orders SET status = $2, updated_at = now(),
+         ready_at = CASE WHEN $3 AND ready_at IS NULL THEN now() ELSE ready_at END
+       WHERE id = $1 RETURNING *`,
+      [id, status, stampReady]
     );
+    await logEvent(id, "status", `Status → ${status}`);
     return rows[0] || null;
   } else {
     const o = mem.orders.find(o => o.id === Number(id));
     if (!o) return null;
     o.status = status;
+    if (stampReady && !o.ready_at) o.ready_at = new Date();
     o.updated_at = new Date();
+    await logEvent(id, "status", `Status → ${status}`);
     return o;
   }
 }
@@ -214,12 +391,14 @@ export async function assignExec(orderId, execId) {
       `UPDATE orders SET exec_id = $2, updated_at = now() WHERE id = $1 RETURNING *`,
       [orderId, execId]
     );
+    await logEvent(orderId, "status", `Delivery agent assigned`);
     return rows[0] || null;
   } else {
     const o = mem.orders.find(o => o.id === Number(orderId));
     if (!o) return null;
     o.exec_id = execId;
     o.updated_at = new Date();
+    await logEvent(orderId, "status", `Delivery agent assigned`);
     return o;
   }
 }
