@@ -408,7 +408,11 @@ app.post("/webhook", async (req, res) => {
           const { inserted } = await addMessage(m.from, { wa_msg_id: m.id, dir: "in", type: m.type, body, media_id: mediaId, ts: Number(m.timestamp) * 1000 || Date.now() }, nameFor(m.from));
           markWhatsAppRead(m.id); // blue ticks (best-effort)
           console.log(`IN  ${m.from}: ${body}`);
-          if (inserted) aiTargets.add(m.from); // only reply to genuinely new messages
+          if (inserted) {
+            aiTargets.add(m.from); // only reply to genuinely new messages
+            // Mark the chat unread and pull it back out of the archive so staff see it.
+            try { await updateContact(m.from, { unread: true, archived: false }); } catch (e) {}
+          }
         }
         // Replies sent from the WhatsApp Business app on the phone (coexistence echoes)
         for (const m of (v.message_echoes || v.smb_message_echoes || [])) {
@@ -456,6 +460,12 @@ app.post("/api/contact/:waId", requireAuth, async (req, res) => {
   const { name, note, address } = req.body || {};
   try { await updateContact(req.params.waId, { name, note, address }); res.json({ ok: true }); }
   catch (err) { console.error("contact update err", err); res.status(500).json({ error: String(err) }); }
+});
+
+// Clear the unread flag when staff open a chat.
+app.post("/api/contact/:waId/read", requireAuth, async (req, res) => {
+  try { await setContactFlag(req.params.waId, "unread", false); res.json({ ok: true }); }
+  catch (err) { console.error("mark read err", err); res.status(500).json({ error: String(err) }); }
 });
 
 // ---- App settings (Train MUKCARE instructions live here) ----

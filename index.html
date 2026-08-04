@@ -47,6 +47,22 @@
   .chead-alert{font-size:11px;font-weight:700;color:#c11a2b;background:#ffe1e1;padding:2px 9px;border-radius:10px;margin-left:8px}
   .alert-human{display:flex;align-items:center;gap:8px;background:#fff2f2;color:#b00020;font-size:13px;padding:9px 16px;border-bottom:1px solid #ffd4d4;border-left:4px solid #e53935}
   .alert-human .mini{margin-left:auto;font-size:12px;padding:5px 10px;border-radius:7px;cursor:pointer}
+  .unread-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--g);margin-right:6px;vertical-align:middle}
+  .arch-btn{background:none;border:0;cursor:pointer;font-size:12px;opacity:.35;margin-left:6px;padding:0}
+  .conv:hover .arch-btn{opacity:.8}
+  .arch-btn:hover{opacity:1}
+  /* settings */
+  .settings{padding:24px;max-width:720px;margin:0 auto;overflow:auto;height:100%;width:100%}
+  .settings h2{margin:0 0 4px;font-size:20px}
+  .settings .sub{color:var(--muted);font-size:13px;margin-bottom:18px}
+  .settings .card{background:#fff;border:1px solid var(--bd);border-radius:12px;padding:18px;margin-bottom:16px;box-shadow:0 1px 4px #12343b12}
+  .settings .card h3{margin:0 0 12px;font-size:15px;color:var(--gd)}
+  .settings label{display:block;font-size:12px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);margin:12px 0 4px}
+  .settings input[type=text],.settings input[type=number],.settings textarea{width:100%;padding:9px 11px;border:1px solid var(--bd);border-radius:7px;font-size:14px;font-family:inherit}
+  .settings .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .settings .save{margin-top:16px;background:var(--g);color:#fff;border:0;border-radius:8px;padding:11px 22px;cursor:pointer;font-size:15px}
+  .settings .qrbox{display:flex;gap:14px;align-items:center;margin-top:8px}
+  .settings .qrbox img{width:120px;height:120px;object-fit:contain;border:1px solid var(--bd);border-radius:8px;background:#fafafa}
 
   /* chat */
   .chat{flex:1;display:flex;flex-direction:column;min-width:0}
@@ -149,6 +165,7 @@
     <button class="navbtn" id="nav-customers" onclick="setView('customers')">👥 Customers</button>
     <button class="navbtn" id="nav-broadcast" onclick="setView('broadcast')">📣 Broadcast</button>
     <button class="navbtn" id="nav-train" onclick="setView('train')">🎓 Train</button>
+    <button class="navbtn" id="nav-settings" onclick="setView('settings')">⚙️ Settings</button>
   </div>
   <div class="r">
     <button class="btn" onclick="setView('train')">🎓 Train MUKCARE</button>
@@ -253,12 +270,13 @@ function startDashboard(){
 
 function setView(v){
   view=v;
-  ['chats','orders','customers','broadcast','train'].forEach(x=>{ const b=document.getElementById('nav-'+x); if(b) b.classList.toggle('active', v===x); });
+  ['chats','orders','customers','broadcast','train','settings'].forEach(x=>{ const b=document.getElementById('nav-'+x); if(b) b.classList.toggle('active', v===x); });
   if(v==='chats'){ renderInbox(); renderList(); if(active){ renderChat(active); renderProfile(active); } }
   else if(v==='orders'){ renderOrders(); loadOrders(); }
   else if(v==='customers'){ renderCustomers(); loadCustomers(); }
   else if(v==='broadcast'){ renderBroadcast(); }
   else if(v==='train'){ renderTrain(); }
+  else if(v==='settings'){ renderSettings(); loadSettings(); }
 }
 
 function renderLogin(msg){
@@ -293,7 +311,7 @@ function renderInbox(){
       <div class="list">
         <div class="search"><input id="q" placeholder="Search name or number…" oninput="onSearch(this.value)"/><button class="iconbtn" title="Refresh chats" onclick="refresh()">↻</button></div>
         <div class="tabs">
-          ${['all','unbooked','booked','spam'].map(t=>`<div class="tab ${filter===t?'active':''}" onclick="setFilter('${t}')">${({all:'All',unbooked:'Not booked',booked:'Booked',spam:'Spam'})[t]}</div>`).join('')}
+          ${['all','needshuman','booked','spam','archived'].map(t=>`<div class="tab ${filter===t?'active':''}" onclick="setFilter('${t}')">${({all:'All',needshuman:'🙋 Needs human',booked:'Booked',spam:'Spam',archived:'Archived'})[t]}</div>`).join('')}
         </div>
         <div class="convs" id="convs"></div>
       </div>
@@ -315,8 +333,10 @@ async function refresh(){
 }
 
 function passFilter(c){
+  if(filter==='archived') return c.archived;
+  if(c.archived) return false; // archived chats only show under the Archived tab
   if(filter==='booked') return c.booked;
-  if(filter==='unbooked') return !c.booked && !c.spam;
+  if(filter==='needshuman') return c.needsHuman;
   if(filter==='spam') return c.spam;
   return true; // all
 }
@@ -329,7 +349,12 @@ function renderList(){
   el.innerHTML = items.map(c=>{
     const last=c.messages[c.messages.length-1];
     return `<div class="conv ${active===c.waId?'active':''}" onclick="open_('${c.waId}')">
-      <div class="top"><span class="n">${esc(c.name)}</span><span class="time">${last?shortTime(last.ts):''}</span></div>
+      <div class="top">
+        <span class="n">${c.unread?'<span class="unread-dot"></span>':''}${esc(c.name)}</span>
+        <span class="time">${last?shortTime(last.ts):''}
+          <button class="arch-btn" title="${c.archived?'Unarchive':'Archive'}" onclick="event.stopPropagation();toggleArchive('${c.waId}',${c.archived?'false':'true'})">${c.archived?'⤴':'🗄'}</button>
+        </span>
+      </div>
       <div class="p">${last?esc(last.dir==='out'?'✓ '+last.text:last.text):''}</div>
       <div class="badges">
         ${c.needsHuman?'<span class="badge human">🙋 Human required</span>':''}
@@ -342,7 +367,15 @@ function renderList(){
   }).join('') || '<div class="empty">No conversations</div>';
 }
 
-function open_(id){ active=id; renderChat(id); renderProfile(id); refresh(); }
+function open_(id){
+  active=id;
+  // Mark read locally + on the server when a chat is opened.
+  if(cache[id] && cache[id].unread){ cache[id].unread=false; api('/api/contact/'+encodeURIComponent(id)+'/read',{method:'POST'}).catch(()=>{}); }
+  renderChat(id); renderProfile(id); refresh();
+}
+async function toggleArchive(id, val){
+  try{ await flag(id,'archived',val==='true'||val===true); flash(val==='true'||val===true?'Archived':'Unarchived'); }catch(e){}
+}
 
 function msgMeta(m, custName){
   if(m.dir==='in') return { cls:'cust', who: custName || 'Customer' };
@@ -764,6 +797,91 @@ async function trainSend(){
   renderTrainChat();
 }
 function trainReset(){ TRAIN_TEST=[]; renderTrainChat(); }
+
+/* ---------- settings ---------- */
+let SET_QR_ID=null;
+function renderSettings(){
+  document.getElementById('app').innerHTML = `
+    <div class="settings">
+      <h2>⚙️ Settings</h2>
+      <p class="sub">Business rules MUKCARE and the dashboard use. Changes take effect immediately — no redeploy.</p>
+
+      <div class="card">
+        <h3>💳 Payment</h3>
+        <label>UPI ID</label>
+        <input type="text" id="s_upi" placeholder="e.g. mukeshmedical@okhdfcbank"/>
+        <label>Payment QR image</label>
+        <div class="qrbox">
+          <img id="s_qrimg" src="" style="display:none" alt="QR"/>
+          <div>
+            <div id="s_qrstate" class="sub" style="margin:0 0 6px">No QR uploaded yet.</div>
+            <input type="file" id="s_qrfile" accept="image/*" onchange="uploadQR(this)"/>
+          </div>
+        </div>
+        <p class="sub" style="margin-top:8px">When a customer asks how to pay, MUKCARE sends your UPI ID and this QR automatically. Until both are set, it hands off to staff.</p>
+      </div>
+
+      <div class="card">
+        <h3>🚚 Delivery rules</h3>
+        <div class="grid2">
+          <div><label>Free delivery within (km)</label><input type="number" id="s_freekm" placeholder="e.g. 3"/></div>
+          <div><label>Free delivery over order value (₹)</label><input type="number" id="s_freeval" placeholder="e.g. 500"/></div>
+          <div><label>Flat delivery charge (₹)</label><input type="number" id="s_flat" placeholder="e.g. 40"/></div>
+          <div><label>Max delivery distance (km)</label><input type="number" id="s_maxkm" placeholder="e.g. 15"/></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>📍 Outlet location (for delivery distance)</h3>
+        <div class="grid2">
+          <div><label>Latitude</label><input type="text" id="s_lat" placeholder="e.g. 17.4998"/></div>
+          <div><label>Longitude</label><input type="text" id="s_lng" placeholder="e.g. 78.3920"/></div>
+        </div>
+        <label>Outlet address</label>
+        <input type="text" id="s_addr" placeholder="Shop address shown to delivery staff"/>
+      </div>
+
+      <div class="card">
+        <h3>🏷️ Discount policy text</h3>
+        <label>Shown by MUKCARE when asked about discounts</label>
+        <input type="text" id="s_disc" placeholder="e.g. up to 20% off; final price confirmed at billing"/>
+      </div>
+
+      <button class="save" onclick="saveSettings()">Save settings</button>
+    </div>`;
+}
+async function loadSettings(){
+  try{
+    const s=await (await api('/api/settings')).json();
+    const set=(id,v)=>{const e=document.getElementById(id); if(e) e.value=v??'';};
+    set('s_upi',s.upiId); set('s_freekm',s.freeDeliveryRadiusKm); set('s_freeval',s.freeDeliveryOrderValue);
+    set('s_flat',s.flatDeliveryCharge); set('s_maxkm',s.maxDeliveryKm); set('s_lat',s.outletLat);
+    set('s_lng',s.outletLng); set('s_addr',s.outletAddress); set('s_disc',s.discountText);
+    SET_QR_ID=s.paymentQrMediaId||null;
+    const st=document.getElementById('s_qrstate'); if(st) st.textContent = SET_QR_ID?('✓ QR on file (id '+SET_QR_ID+'). Choose a file to replace it.'):'No QR uploaded yet.';
+  }catch(e){}
+}
+async function uploadQR(input){
+  const f=input.files&&input.files[0]; if(!f) return;
+  const st=document.getElementById('s_qrstate'); if(st) st.textContent='Uploading…';
+  const reader=new FileReader();
+  reader.onload=async()=>{
+    try{
+      const r=await api('/api/media',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataUrl:reader.result})});
+      const j=await r.json();
+      if(j.id){ SET_QR_ID=j.id; const img=document.getElementById('s_qrimg'); if(img){img.src=reader.result;img.style.display='block';} if(st) st.textContent='✓ QR ready (id '+j.id+'). Click Save settings to apply.'; }
+      else if(st) st.textContent='Upload failed.';
+    }catch(e){ if(st) st.textContent='Upload failed.'; }
+  };
+  reader.readAsDataURL(f);
+}
+async function saveSettings(){
+  const g=id=>{const e=document.getElementById(id); return e?e.value:undefined;};
+  const body={ upiId:g('s_upi'), paymentQrMediaId:SET_QR_ID, freeDeliveryRadiusKm:g('s_freekm'), freeDeliveryOrderValue:g('s_freeval'),
+    flatDeliveryCharge:g('s_flat'), maxDeliveryKm:g('s_maxkm'), outletLat:g('s_lat'), outletLng:g('s_lng'),
+    outletAddress:g('s_addr'), discountText:g('s_disc') };
+  try{ await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); flash('Settings saved'); }catch(e){ flash('Save failed'); }
+}
 
 /* ---------- broadcast (bulk promo) ---------- */
 let BC_RECIPIENTS=[];

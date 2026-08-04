@@ -145,7 +145,7 @@ export async function updateStatus(waMsgId, status) {
 export async function getConversations() {
   if (pool) {
     const { rows: cs } = await pool.query(
-      `SELECT wa_id, name, booked, human_control, spam, note, address, needs_human,
+      `SELECT wa_id, name, booked, human_control, spam, note, address, needs_human, archived, unread,
               EXTRACT(EPOCH FROM mukcare_paused_until)*1000 AS mukcare_paused_until,
               EXTRACT(EPOCH FROM created_at)*1000 AS created,
               EXTRACT(EPOCH FROM updated_at)*1000 AS updated
@@ -168,6 +168,7 @@ export async function getConversations() {
         note: c.note || "",
         address: c.address || "",
         needsHuman: c.needs_human,
+        archived: c.archived, unread: c.unread,
         pausedUntil: c.mukcare_paused_until ? Number(c.mukcare_paused_until) : null,
         created: Number(c.created),
         updated: Number(c.updated),
@@ -178,12 +179,12 @@ export async function getConversations() {
   } else {
     return Object.values(mem.contacts)
       .sort((a, b) => (b.updated || 0) - (a.updated || 0))
-      .map(c => ({ waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "", needsHuman: c.needs_human, pausedUntil: c.mukcare_paused_until || null, created: c.created || c.updated, updated: c.updated, messages: c.messages }));
+      .map(c => ({ waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "", needsHuman: c.needs_human, archived: c.archived, unread: c.unread, pausedUntil: c.mukcare_paused_until || null, created: c.created || c.updated, updated: c.updated, messages: c.messages }));
   }
 }
 
 export async function setContactFlag(waId, field, value) {
-  if (!["booked", "human_control", "spam", "needs_human"].includes(field)) return;
+  if (!["booked", "human_control", "spam", "needs_human", "archived", "unread"].includes(field)) return;
   if (pool) {
     await pool.query(`UPDATE contacts SET ${field} = $2, updated_at = now() WHERE wa_id = $1`, [waId, value]);
   } else if (mem.contacts[waId]) {
