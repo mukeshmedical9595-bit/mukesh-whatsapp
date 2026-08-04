@@ -191,6 +191,32 @@ export async function setContactFlag(waId, field, value) {
   }
 }
 
+// Spam guard: bump the consecutive non-order message counter, or reset it to 0.
+// Returns the new count so the caller can auto-flag spam past a threshold.
+export async function bumpNonOrderCount(waId, reset = false) {
+  if (!waId) return 0;
+  if (pool) {
+    const { rows } = await pool.query(
+      reset
+        ? `UPDATE contacts SET non_order_count = 0, updated_at = now() WHERE wa_id = $1 RETURNING non_order_count`
+        : `UPDATE contacts SET non_order_count = non_order_count + 1, updated_at = now() WHERE wa_id = $1 RETURNING non_order_count`,
+      [waId]
+    );
+    return rows[0]?.non_order_count || 0;
+  } else if (mem.contacts[waId]) {
+    mem.contacts[waId].non_order_count = reset ? 0 : (mem.contacts[waId].non_order_count || 0) + 1;
+    return mem.contacts[waId].non_order_count;
+  }
+  return 0;
+}
+
+// Read several settings at once: getSettings(["upi_id","payment_qr_media_id"]) -> {key:value}.
+export async function getSettings(keys = []) {
+  const out = {};
+  for (const k of keys) { try { out[k] = await getSetting(k); } catch { out[k] = null; } }
+  return out;
+}
+
 // Pause (or resume) MUKCARE's auto-replies on a single chat.
 // untilMs = epoch ms to pause until, or null to resume immediately.
 export async function setMukcarePause(waId, untilMs) {
@@ -205,24 +231,46 @@ export async function setMukcarePause(waId, untilMs) {
   }
 }
 
-// Update editable profile fields (name, note, and/or address).
+// Update editable profile fields. Accepts: name, note, address, locationLat,
+// locationLng, alternateNumber, nameConfirmed, defaultPatient, source,
+// archived, unread. Only provided (non-undefined) fields are changed.
 export async function updateContact(waId, fields) {
   if (!waId || !fields) return;
-  const { name, note, address } = fields;
+  const f = fields;
   if (pool) {
     await pool.query(
       `UPDATE contacts SET
-         name = COALESCE($2, name),
-         note = COALESCE($3, note),
-         address = COALESCE($4, address),
+         name             = COALESCE($2, name),
+         note             = COALESCE($3, note),
+         address          = COALESCE($4, address),
+         location_lat     = COALESCE($5, location_lat),
+         location_lng     = COALESCE($6, location_lng),
+         alternate_number = COALESCE($7, alternate_number),
+         name_confirmed   = COALESCE($8, name_confirmed),
+         default_patient  = COALESCE($9, default_patient),
+         source           = COALESCE($10, source),
+         archived         = COALESCE($11, archived),
+         unread           = COALESCE($12, unread),
          updated_at = now()
        WHERE wa_id = $1`,
-      [waId, name ?? null, note ?? null, address ?? null]
+      [waId, f.name ?? null, f.note ?? null, f.address ?? null,
+       f.locationLat ?? null, f.locationLng ?? null, f.alternateNumber ?? null,
+       f.nameConfirmed ?? null, f.defaultPatient ?? null, f.source ?? null,
+       f.archived ?? null, f.unread ?? null]
     );
   } else if (mem.contacts[waId]) {
-    if (name != null) mem.contacts[waId].name = name;
-    if (note != null) mem.contacts[waId].note = note;
-    if (address != null) mem.contacts[waId].address = address;
+    const c = mem.contacts[waId];
+    if (f.name != null) c.name = f.name;
+    if (f.note != null) c.note = f.note;
+    if (f.address != null) c.address = f.address;
+    if (f.locationLat != null) c.location_lat = f.locationLat;
+    if (f.locationLng != null) c.location_lng = f.locationLng;
+    if (f.alternateNumber != null) c.alternate_number = f.alternateNumber;
+    if (f.nameConfirmed != null) c.name_confirmed = f.nameConfirmed;
+    if (f.defaultPatient != null) c.default_patient = f.defaultPatient;
+    if (f.source != null) c.source = f.source;
+    if (f.archived != null) c.archived = f.archived;
+    if (f.unread != null) c.unread = f.unread;
   }
 }
 
@@ -278,6 +326,7 @@ export async function getConversation(waId) {
   if (pool) {
     const { rows: cs } = await pool.query(
       `SELECT wa_id, name, booked, human_control, spam, note, address, needs_human,
+              name_confirmed, location_lat, location_lng, non_order_count,
               EXTRACT(EPOCH FROM mukcare_paused_until)*1000 AS mukcare_paused_until
        FROM contacts WHERE wa_id = $1`,
       [waId]
@@ -292,13 +341,14 @@ export async function getConversation(waId) {
     return {
       waId: c.wa_id, name: c.name || c.wa_id,
       booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "", needsHuman: c.needs_human,
+      nameConfirmed: c.name_confirmed, locationLat: c.location_lat, locationLng: c.location_lng, nonOrderCount: c.non_order_count || 0,
       pausedUntil: c.mukcare_paused_until ? Number(c.mukcare_paused_until) : null,
       messages: ms.map(m => ({ dir: m.dir, type: m.type, text: m.body, ts: Number(m.ts), status: m.status, bot: m.bot, mediaId: m.media_id }))
     };
   }
   const c = mem.contacts[waId];
   if (!c) return null;
-  return { waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "", needsHuman: c.needs_human, pausedUntil: c.mukcare_paused_until || null, messages: c.messages };
+  return { waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "", needsHuman: c.needs_human, nameConfirmed: c.name_confirmed, locationLat: c.location_lat, locationLng: c.location_lng, nonOrderCount: c.non_order_count || 0, pausedUntil: c.mukcare_paused_until || null, messages: c.messages };
 }
 
 // ---- Media (prescription images/documents) ----

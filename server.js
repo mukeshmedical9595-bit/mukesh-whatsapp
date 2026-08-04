@@ -2,15 +2,17 @@
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
-import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, setMukcarePause, updateContact, getSetting, setSetting, saveMedia, getMedia, listContacts, createCustomer, deleteContact, getLatestImageMediaId, dbEnabled } from "./db.js";
+import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, setMukcarePause, updateContact, getSetting, setSetting, getSettings, bumpNonOrderCount, saveMedia, getMedia, listContacts, createCustomer, deleteContact, getLatestImageMediaId, dbEnabled } from "./db.js";
 import { mukcareReply } from "./ai.js";
 import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, deleteOrder, createExec, listExecs, setExecActive, execHandoffMessage } from "./orders.js";
 import { sendTemplate, sendOrderReady, sendOrderDispatched, sendOrderReminder, sendBillSent, sendDeliveryAssignment } from "./templates.js";
 import { initCampaignsDb, sendCampaign, recordOptOut } from "./campaigns.js";
+import crypto from "crypto";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-app.use(express.json());
+// Keep the raw request body so we can verify Meta's X-Hub-Signature-256 on the webhook.
+app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
 // ---- Config (from environment) ----
 const PORT           = process.env.PORT || 3000;
@@ -24,8 +26,35 @@ let PHONE_NUMBER_ID  = process.env.PHONE_NUMBER_ID || "";
 let WABA_ID          = process.env.WABA_ID || "";
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "";
 const ORDER_DELETE_PASSWORD = process.env.ORDER_DELETE_PASSWORD || "";
+// Public base URL of this Render service, used to build media links (e.g. invoice PDFs).
+const PUBLIC_URL = (process.env.PUBLIC_URL || "https://mukesh-whatsapp.onrender.com").replace(/\/+$/, "");
 
 const GRAPH = `https://graph.facebook.com/${GRAPH_VERSION}`;
+const MEDIA_SECRET = APP_SECRET || DASHBOARD_PASSWORD || "mukcare-media";
+
+// Signed public link to a media blob, so WhatsApp can fetch outbound images/PDFs
+// (QR, invoices) without our dashboard auth, while prescription media stays private
+// (its id would need a matching token, which we only mint for files we choose to send).
+function mediaToken(id) {
+  return crypto.createHmac("sha256", MEDIA_SECRET).update(String(id)).digest("hex").slice(0, 24);
+}
+function mediaLink(id) {
+  return `${PUBLIC_URL}/pub/${id}?t=${mediaToken(id)}`;
+}
+
+// Verify Meta's webhook payload signature (X-Hub-Signature-256 = HMAC-SHA256 of the
+// raw body keyed by the app secret). Returns true if valid, or if no APP_SECRET is
+// configured yet (so the app stays usable during setup). Uses a timing-safe compare.
+function verifyWebhookSignature(req) {
+  if (!APP_SECRET) return true; // not configured yet
+  const sig = req.header("x-hub-signature-256") || "";
+  if (!sig.startsWith("sha256=") || !req.rawBody) return false;
+  const expected = "sha256=" + crypto.createHmac("sha256", APP_SECRET).update(req.rawBody).digest("hex");
+  try {
+    const a = Buffer.from(sig), b = Buffer.from(expected);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch { return false; }
+}
 
 // Simple single-password gate for the dashboard API. The frontend sends the
 // password in the "x-dash-key" header (over HTTPS). If DASHBOARD_PASSWORD is
@@ -102,6 +131,75 @@ async function downloadWhatsAppMedia(mediaId) {
   } catch (e) { console.error("downloadWhatsAppMedia err", e); return null; }
 }
 
+// Send a document (e.g. an invoice PDF) by public link. Persists it for the dashboard.
+async function sendWhatsAppDocument(to, { link, filename, caption } = {}, { bot = false } = {}) {
+  if (!ACCESS_TOKEN || !PHONE_NUMBER_ID || !link) return { ok: false, status: 400, error: { error: "Not connected / no link." } };
+  try {
+    const r = await fetch(`${GRAPH}/${PHONE_NUMBER_ID}/messages`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messaging_product: "whatsapp", to, type: "document",
+        document: { link, filename: filename || "document.pdf", ...(caption ? { caption } : {}) }
+      })
+    });
+    const data = await r.json();
+    if (!r.ok) { console.error("send document err", data); return { ok: false, status: r.status, error: data }; }
+    await addMessage(to, { wa_msg_id: data.messages?.[0]?.id, dir: "out", type: "document", body: caption || `[document] ${filename || ""}`, ts: Date.now(), status: "sent", bot });
+    return { ok: true, data };
+  } catch (err) { console.error("sendWhatsAppDocument err", err); return { ok: false, status: 500, error: { error: String(err) } }; }
+}
+
+// Send an image (e.g. the payment QR) by public link. Persists it for the dashboard.
+async function sendWhatsAppImage(to, { link, caption } = {}, { bot = false } = {}) {
+  if (!ACCESS_TOKEN || !PHONE_NUMBER_ID || !link) return { ok: false, status: 400, error: { error: "Not connected / no link." } };
+  try {
+    const r = await fetch(`${GRAPH}/${PHONE_NUMBER_ID}/messages`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ messaging_product: "whatsapp", to, type: "image", image: { link, ...(caption ? { caption } : {}) } })
+    });
+    const data = await r.json();
+    if (!r.ok) { console.error("send image err", data); return { ok: false, status: r.status, error: data }; }
+    await addMessage(to, { wa_msg_id: data.messages?.[0]?.id, dir: "out", type: "image", body: caption || "[image]", ts: Date.now(), status: "sent", bot });
+    return { ok: true, data };
+  } catch (err) { console.error("sendWhatsAppImage err", err); return { ok: false, status: 500, error: { error: String(err) } }; }
+}
+
+// Send our payment details (UPI id text + QR image) to a customer. Reads the UPI id
+// and QR media id from Settings; no-op if neither is configured.
+async function sendPaymentDetails(to) {
+  const cfg = await getSettings(["upi_id", "payment_qr_media_id"]);
+  if (!cfg.upi_id && !cfg.payment_qr_media_id) return { ok: false, error: "payment not configured" };
+  if (cfg.upi_id) await sendWhatsAppText(to, `You can pay via UPI to: ${cfg.upi_id}\nPlease share a screenshot after paying. 🙏`, { bot: true });
+  if (cfg.payment_qr_media_id) await sendWhatsAppImage(to, { link: mediaLink(cfg.payment_qr_media_id), caption: "Scan to pay (UPI)" }, { bot: true });
+  return { ok: true };
+}
+
+// Mark an inbound WhatsApp message as read (blue ticks) - best-effort, never throws.
+async function markWhatsAppRead(messageId) {
+  if (!ACCESS_TOKEN || !PHONE_NUMBER_ID || !messageId) return;
+  try {
+    await fetch(`${GRAPH}/${PHONE_NUMBER_ID}/messages`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ messaging_product: "whatsapp", status: "read", message_id: messageId })
+    });
+  } catch (e) { /* best-effort */ }
+}
+
+// WhatsApp only allows free-form (non-template) messages within 24h of the customer's
+// last inbound message. Returns true if we're still inside that window.
+async function within24hWindow(waId) {
+  try {
+    const convo = await getConversation(waId);
+    if (!convo) return false;
+    const lastIn = [...(convo.messages || [])].reverse().find(m => m.dir === "in");
+    if (!lastIn) return false;
+    return (Date.now() - Number(lastIn.ts)) < 24 * 60 * 60 * 1000;
+  } catch { return false; }
+}
+
 // Notify a customer of a status. Tries the approved TEMPLATE first (delivers even
 // outside WhatsApp's 24h window); if that fails (e.g. template not yet approved),
 // falls back to plain text (delivers only inside the 24h window).
@@ -158,7 +256,9 @@ async function handleAiReply(waId) {
       console.log(`MUKCARE paused for ${waId} until ${new Date(convo.pausedUntil).toISOString()} - skipping auto-reply.`);
       return;
     }
-    const trainInstructions = await getSetting("train_instructions");
+    const cfg = await getSettings(["train_instructions", "upi_id", "payment_qr_media_id"]);
+    const trainInstructions = cfg.train_instructions;
+    const paymentConfigured = Boolean(cfg.upi_id || cfg.payment_qr_media_id);
 
     // If the customer's latest message is a photo, load it so MUKCARE can see it
     // (to identify a product, or recognise a prescription).
@@ -177,17 +277,27 @@ async function handleAiReply(waId) {
     const result = await mukcareReply({
       contact: { ...convo, messages: convo.messages },
       messages: convo.messages,
-      settings: { trainInstructions },
+      settings: { trainInstructions, paymentConfigured },
       store: AI_STORE,
       now: new Date(),
       latestImage
     });
     if (result.error) { console.error("MUKCARE error:", result.error); return; }
 
-    // Save the patient's name (as given by the customer in chat) as the display name.
+    // Save the patient's name (as given by the customer in chat) as the display name,
+    // and mark it confirmed so KYC is skipped on future chats.
     if (result.patientName) {
-      await updateContact(waId, { name: result.patientName });
+      await updateContact(waId, { name: result.patientName, nameConfirmed: true });
       convo.name = result.patientName;
+    }
+
+    // Spam guard: count consecutive non-order messages; auto-flag as spam past a
+    // threshold. Any order-related turn resets the counter.
+    const orderish = result.intent === "order" || result.intent === "enquiry" || result.order || result.suggestBooked;
+    if (orderish) { await bumpNonOrderCount(waId, true); }
+    else if (result.intent === "spam" || result.intent === "chitchat") {
+      const n = await bumpNonOrderCount(waId, false);
+      if (n >= 6) { await setContactFlag(waId, "spam", true); console.log(`Auto-flagged spam: ${waId} (${n} non-order msgs)`); }
     }
 
     if (result.reply) {
@@ -197,6 +307,10 @@ async function handleAiReply(waId) {
         await sendWhatsAppText(waId, result.reply, { bot: true });
       }
       console.log(`MUKCARE -> ${waId}: ${result.reply}${result.buttons?.length ? " [buttons: " + result.buttons.map(b => b.title).join(", ") + "]" : ""}`);
+    }
+    // Customer asked how to pay and payment is configured: send UPI id + QR image.
+    if (result.sendPayment && paymentConfigured) {
+      try { await sendPaymentDetails(waId); console.log(`MUKCARE sent payment details -> ${waId}`); } catch (e) { console.error("sendPaymentDetails err", e); }
     }
     if (result.suggestBooked) await setContactFlag(waId, "booked", true);
     // MUKCARE decided a human should handle this chat: flag it and pause MUKCARE's
@@ -259,6 +373,8 @@ app.get("/webhook", (req, res) => {
 
 // ---- Webhook receiver ----
 app.post("/webhook", async (req, res) => {
+  // Reject forged payloads: verify Meta's HMAC signature before doing anything.
+  if (!verifyWebhookSignature(req)) { console.warn("Webhook signature invalid - ignoring."); return res.sendStatus(401); }
   res.sendStatus(200); // ack fast
   const aiTargets = new Set();
   try {
@@ -285,11 +401,12 @@ app.post("/webhook", async (req, res) => {
             const lat = m.location.latitude, lng = m.location.longitude;
             const mapsLink = `https://maps.google.com/?q=${lat},${lng}`;
             body = `📍 ${mapsLink}`;
-            try { await updateContact(m.from, { address: mapsLink }); } catch (e) { console.error("save location err", e); }
+            try { await updateContact(m.from, { address: mapsLink, locationLat: lat, locationLng: lng }); } catch (e) { console.error("save location err", e); }
           }
           // Marketing opt-out: a bare "STOP" removes them from future campaigns.
           if ((m.text?.body || "").trim().toUpperCase() === "STOP") await recordOptOut(m.from);
           const { inserted } = await addMessage(m.from, { wa_msg_id: m.id, dir: "in", type: m.type, body, media_id: mediaId, ts: Number(m.timestamp) * 1000 || Date.now() }, nameFor(m.from));
+          markWhatsAppRead(m.id); // blue ticks (best-effort)
           console.log(`IN  ${m.from}: ${body}`);
           if (inserted) aiTargets.add(m.from); // only reply to genuinely new messages
         }
@@ -342,17 +459,34 @@ app.post("/api/contact/:waId", requireAuth, async (req, res) => {
 });
 
 // ---- App settings (Train MUKCARE instructions live here) ----
+// Business-rule settings exposed to the dashboard Settings tab. Keys are stored
+// in the generic settings table; camelCase in the API maps to snake_case keys.
+const SETTINGS_KEYS = {
+  trainInstructions: "train_instructions",
+  upiId: "upi_id",
+  paymentQrMediaId: "payment_qr_media_id",
+  freeDeliveryRadiusKm: "free_delivery_radius_km",
+  freeDeliveryOrderValue: "free_delivery_order_value",
+  flatDeliveryCharge: "flat_delivery_charge",
+  maxDeliveryKm: "max_delivery_km",
+  outletLat: "outlet_lat",
+  outletLng: "outlet_lng",
+  outletAddress: "outlet_address",
+  discountText: "discount_text",
+};
 app.get("/api/settings", requireAuth, async (req, res) => {
   try {
-    res.json({
-      trainInstructions: await getSetting("train_instructions")
-    });
+    const out = {};
+    for (const [camel, key] of Object.entries(SETTINGS_KEYS)) out[camel] = await getSetting(key);
+    res.json(out);
   } catch (err) { console.error("settings get err", err); res.status(500).json({ error: String(err) }); }
 });
 app.post("/api/settings", requireAuth, async (req, res) => {
-  const { trainInstructions } = req.body || {};
+  const body = req.body || {};
   try {
-    if (trainInstructions !== undefined) await setSetting("train_instructions", String(trainInstructions));
+    for (const [camel, key] of Object.entries(SETTINGS_KEYS)) {
+      if (body[camel] !== undefined) await setSetting(key, body[camel] === null ? "" : String(body[camel]));
+    }
     res.json({ ok: true });
   } catch (err) { console.error("settings set err", err); res.status(500).json({ error: String(err) }); }
 });
@@ -498,6 +632,37 @@ app.get("/media/:id", requireAuth, async (req, res) => {
     res.set("Cache-Control", "private, max-age=86400");
     res.send(Buffer.isBuffer(m.data) ? m.data : Buffer.from(m.data));
   } catch (e) { console.error("media err", e); res.sendStatus(500); }
+});
+
+// ---- Public signed media (for outbound WhatsApp links: QR, invoices) ----
+// No dashboard auth, but a valid HMAC token is required, so only files we chose
+// to mint a link for are reachable (prescription ids won't validate).
+app.get("/pub/:id", async (req, res) => {
+  try {
+    if ((req.query.t || "") !== mediaToken(req.params.id)) return res.sendStatus(403);
+    const m = await getMedia(req.params.id);
+    if (!m || !m.data) return res.sendStatus(404);
+    res.set("Content-Type", m.mime || "application/octet-stream");
+    res.set("Cache-Control", "public, max-age=86400");
+    res.send(Buffer.isBuffer(m.data) ? m.data : Buffer.from(m.data));
+  } catch (e) { console.error("pub media err", e); res.sendStatus(500); }
+});
+
+// ---- Upload a media blob (e.g. the payment QR, a bill PDF) as base64 ----
+// Body: { base64 | dataUrl, mime }. Returns { id }.
+app.post("/api/media", requireAuth, async (req, res) => {
+  try {
+    let { base64, dataUrl, mime } = req.body || {};
+    if (dataUrl && !base64) {
+      const m = String(dataUrl).match(/^data:([^;]+);base64,(.*)$/);
+      if (m) { mime = mime || m[1]; base64 = m[2]; }
+    }
+    if (!base64) return res.status(400).json({ error: "no data" });
+    const buffer = Buffer.from(base64, "base64");
+    if (buffer.length > 8 * 1024 * 1024) return res.status(413).json({ error: "too large (max 8MB)" });
+    const id = await saveMedia({ mime: mime || "application/octet-stream", buffer });
+    res.json({ id });
+  } catch (e) { console.error("media upload err", e); res.status(500).json({ error: String(e) }); }
 });
 
 // ---- One-time: create all MUKCARE message templates via the Graph API ----

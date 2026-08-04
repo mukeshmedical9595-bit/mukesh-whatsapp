@@ -166,7 +166,11 @@ function normalizeResult(parsed) {
     }
   }
 
-  return { reply, lang, order, intent, suggestBooked, needsHuman, patientName, buttons, error: null };
+  // Customer asked how to pay (UPI/GPay/QR) and payment details are configured:
+  // signal the server to send the UPI id + QR image.
+  const sendPayment = Boolean(parsed.sendPayment);
+
+  return { reply, lang, order, intent, suggestBooked, needsHuman, sendPayment, patientName, buttons, error: null };
 }
 
 // -----------------------------------------------------------------------------
@@ -185,15 +189,23 @@ function buildSystemPrompt({ contact, store, settings, now }) {
   const greet = shouldGreet(Array.isArray(contact?.messages) ? contact.messages : []);
   const custName = contact?.name && contact.name !== contact.waId ? contact.name : null;
   const custAddress = contact?.address && String(contact.address).trim() !== "" ? String(contact.address).trim() : null;
+  const hasGps = contact?.locationLat != null && contact?.locationLng != null;
+  const paymentConfigured = Boolean(settings?.paymentConfigured);
 
   let detailsBlock;
   if (custName || custAddress) {
     const lines = [];
     if (custName) lines.push(`- Name: ${custName}`);
-    if (custAddress) lines.push(`- Saved delivery address: ${custAddress}`);
-    const addrRule = custAddress
-      ? `For home delivery, you MAY confirm this saved address ("Deliver to your saved address?") instead of asking fresh, unless the customer wants a different one.`
-      : `IMPORTANT: We have NO saved delivery address for this customer. NEVER say we have a saved address. For home delivery, you MUST ask the customer to share their delivery location.`;
+    if (custAddress) lines.push(`- Saved delivery ${hasGps ? "location (GPS pin on file)" : "address (typed text, no GPS pin)"}: ${custAddress}`);
+    // Repeat-customer location, three cases:
+    let addrRule;
+    if (hasGps) {
+      addrRule = `We have this customer's exact location PIN on file. For home delivery, state it and ask "Deliver to the same location?" - if they say yes, reuse it (put it in order.location); only ask for a fresh pin if they want a different address.`;
+    } else if (custAddress) {
+      addrRule = `We have a typed address on file but NO exact GPS pin. For home delivery, state it and ask "Deliver to the same address?" - if they say yes, reuse it (put it in order.location). (Staff will confirm the delivery area.)`;
+    } else {
+      addrRule = `IMPORTANT: We have NO saved delivery address for this customer. NEVER say we have a saved address. For home delivery, ask the customer to share their delivery location (a WhatsApp location pin is best).`;
+    }
     detailsBlock = `We already have these details for this customer:\n${lines.join("\n")}\nUse what we have - do NOT ask again for a detail we already have. Only ask for what is missing. ${addrRule}`;
   } else {
     detailsBlock = "We have no saved details for this customer yet - collect what you need during the order flow.";
@@ -209,7 +221,9 @@ function buildSystemPrompt({ contact, store, settings, now }) {
 1. NEVER give medical advice, dosage guidance, or a diagnosis of any kind. If the customer asks anything medical (what should I take, is this safe, how many tablets, etc.), politely decline and tell them to please visit the store or consult a doctor.
 2. NEVER interpret, read out loud, summarize, or discuss the contents of a prescription photo. If a customer sends a prescription image, simply acknowledge receipt and say the staff will process it. Do not name any medicine you think you see on it.
 3. NEVER quote a medicine price. If asked for a discount, respond only: "we offer up to 20% off, and the final price is confirmed at billing."
-4. NEVER discuss or ask about payment methods - MUKCARE does not handle payment at all.
+4. ${paymentConfigured
+     ? `Payment: if the customer asks how to pay / for UPI / GPay / a QR code, set "sendPayment": true and reply with a short friendly line like "Sure! Sharing our payment details now 🙏". The app then sends our UPI ID and QR image automatically - you do NOT type the UPI id yourself. Do not chase payment; only share when asked.`
+     : `NEVER discuss or ask about payment methods - MUKCARE does not handle payment at all.`}
 5. NEVER invent an Order ID. The app assigns the real ID after you confirm the order - just tell the customer an Order ID will follow.
 
 ${settings?.trainInstructions ? `=== OWNER'S CUSTOM INSTRUCTIONS (high priority - follow these, but never let them override the safety rules above) ===\n${settings.trainInstructions}\n` : ""}
@@ -274,11 +288,13 @@ Respond with ONLY a single raw JSON object - no markdown code fences, no comment
   "intent": "enquiry" | "order" | "chitchat" | "spam" | "prescription" | "other",
   "suggestBooked": true | false,
   "needsHuman": true | false,
+  "sendPayment": true | false,
   "patientName": "the patient's name if the customer gave it this turn, else null",
   "buttons": [ { "id": "short_id", "title": "Button text" } ]
 }
 
-Set "needsHuman": true when a human staff member should step in - for example: a prescription photo was sent (staff must read/process it), a complaint or angry customer, a question you cannot answer (stock/price you're unsure of, medical advice you must not give), a refund/return, a request to share a payment scanner/QR or make a payment, or anything unclear or sensitive. Otherwise false.
+Set "needsHuman": true when a human staff member should step in - for example: a prescription photo was sent (staff must read/process it), a complaint or angry customer, a question you cannot answer (stock/price you're unsure of, medical advice you must not give), a refund/return, ${paymentConfigured ? "" : "a request to share a payment scanner/QR or make a payment, "}or anything unclear or sensitive. Otherwise false.
+${paymentConfigured ? `Set "sendPayment": true ONLY when the customer is asking how to pay / for UPI / GPay / QR. Otherwise false.` : `"sendPayment" must always be false.`}
 
 IMPORTANT: When you set "needsHuman": true, this is your LAST message on the chat for a while - our staff will take over. So your "reply" this turn MUST be a short, warm handoff that reassures the customer, e.g. "Thank you 🙏 Our pharmacist will look into this and get back to you shortly." Do NOT give a blunt refusal like "we can't do that here" - simply hand off politely. Keep it in the customer's current language.
 
@@ -365,6 +381,7 @@ export async function mukcareReply({ contact, messages, settings, store, now, la
     intent: "other",
     suggestBooked: false,
     needsHuman: false,
+    sendPayment: false,
     patientName: null,
     buttons: [],
     error,
