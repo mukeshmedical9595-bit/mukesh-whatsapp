@@ -8,6 +8,7 @@ import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assig
 import { sendTemplate, sendOrderReady, sendOrderDispatched, sendOrderReminder, sendBillSent, sendDeliveryAssignment } from "./templates.js";
 import { initCampaignsDb, sendCampaign, recordOptOut } from "./campaigns.js";
 import crypto from "crypto";
+import PDFDocument from "pdfkit";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -204,6 +205,54 @@ async function sendPaymentDetails(to) {
   if (cfg.upi_id) await sendWhatsAppText(to, `You can pay via UPI to: ${cfg.upi_id}\nPlease share a screenshot after paying. 🙏`, { bot: true });
   if (cfg.payment_qr_media_id) await sendWhatsAppImage(to, { link: mediaLink(cfg.payment_qr_media_id), caption: "Scan to pay (UPI)" }, { bot: true });
   return { ok: true };
+}
+
+// Build a simple invoice PDF (Buffer) from an order + the bill's line items.
+function generateInvoicePdf(order, bill) {
+  return new Promise((resolve, reject) => {
+    try {
+      const doc = new PDFDocument({ size: "A4", margin: 40 });
+      const chunks = [];
+      doc.on("data", c => chunks.push(c));
+      doc.on("end", () => resolve(Buffer.concat(chunks)));
+      doc.on("error", reject);
+      doc.fontSize(20).fillColor("#0b6b5e").text("Mukesh Medical");
+      doc.fontSize(9).fillColor("#555").text("Narayanaguda, Hyderabad");
+      doc.moveUp(2).fontSize(14).fillColor("#111").text("INVOICE", { align: "right" });
+      doc.moveDown(1.2);
+      doc.fontSize(10).fillColor("#111");
+      doc.text(`Order: ${order.order_code || ""}`);
+      if (bill.billNo) doc.text(`Bill No: ${bill.billNo}`);
+      doc.text(`Date: ${new Date().toLocaleString("en-IN")}`);
+      doc.text(`Customer: ${order.customer_name || "-"}`);
+      if (order.phone || order.wa_id) doc.text(`Phone: ${order.phone || order.wa_id}`);
+      doc.moveDown(0.8);
+      const items = Array.isArray(bill.items) ? bill.items : [];
+      let y = doc.y;
+      doc.fontSize(10).fillColor("#0b6b5e");
+      doc.text("Item", 40, y); doc.text("Qty", 340, y); doc.text("Rate", 400, y); doc.text("Amount", 480, y);
+      doc.moveTo(40, doc.y + 2).lineTo(555, doc.y + 2).strokeColor("#cccccc").stroke();
+      doc.fillColor("#111");
+      let total = 0;
+      for (const it of items) {
+        y = doc.y + 6;
+        const amt = Number(it.value != null ? it.value : (Number(it.rate || 0) * Number(it.qty || 0)));
+        total += amt;
+        doc.text(String(it.name || "").slice(0, 46), 40, y, { width: 290 });
+        doc.text(String(it.qty ?? ""), 340, y);
+        doc.text(it.rate != null ? Number(it.rate).toFixed(2) : "", 400, y);
+        doc.text(amt.toFixed(2), 480, y);
+      }
+      doc.moveDown(0.6);
+      doc.moveTo(40, doc.y + 2).lineTo(555, doc.y + 2).strokeColor("#cccccc").stroke();
+      doc.moveDown(0.6);
+      const net = bill.amount != null ? Number(bill.amount) : total;
+      doc.fontSize(12).fillColor("#111").text(`Net Amount:  Rs. ${net.toFixed(2)}`, { align: "right" });
+      doc.moveDown(2);
+      doc.fontSize(9).fillColor("#777").text("Thank you for choosing Mukesh Medical. System-generated invoice.", { align: "center" });
+      doc.end();
+    } catch (e) { reject(e); }
+  });
 }
 
 // Mark an inbound WhatsApp message as read (blue ticks) - best-effort, never throws.
@@ -730,6 +779,11 @@ app.post("/api/bridge/results", async (req, res) => {
       let billMediaId = null;
       if (bill.invoiceBase64) {
         try { billMediaId = await saveMedia({ mime: bill.invoiceMime || "application/pdf", buffer: Buffer.from(bill.invoiceBase64, "base64") }); } catch (e) {}
+      }
+      // No invoice attached? Generate one from the bill's line items so the customer gets a PDF.
+      if (!billMediaId) {
+        try { const pdf = await generateInvoicePdf(order, bill); billMediaId = await saveMedia({ mime: "application/pdf", buffer: pdf }); }
+        catch (e) { console.error("invoice pdf gen err", e); }
       }
       const isDelivery = order.fulfillment === "delivery";
       let distanceKm = null, deliveryFee = null, deliveryFeePending = null;

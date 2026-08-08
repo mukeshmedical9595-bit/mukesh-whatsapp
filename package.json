@@ -1,7 +1,7 @@
 {
   "name": "mukesh-whatsapp",
-  "version": "1.0.0",
   "description": "Mukesh Medical - WhatsApp Coexistence onboarding + customer reply dashboard (Cloud API)",
+  "version": "1.0.0",
   "main": "server.js",
   "type": "module",
   "scripts": {
@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "pg": "^8.11.5"
+    "pg": "^8.11.5",
+    "pdfkit": "^0.15.0"
   }
 }
