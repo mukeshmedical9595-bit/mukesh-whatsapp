@@ -204,6 +204,17 @@
   </div>
 </div>
 
+<!-- Import customers modal -->
+<div class="modal-bg" id="importBg">
+  <div class="modal" style="width:640px">
+    <h2>⬆ Import customers</h2>
+    <p>Paste rows copied from your sheet. One customer per line, columns in this order: <b>Name, Mobile, Alternate, Location</b> — separated by a Tab (copy from Google Sheets pastes tabs automatically) or a comma. A header row like "Name" is skipped automatically.</p>
+    <textarea id="impData" placeholder="MADAM SUNITA&#9;9876543210&#9;9998887776&#9;17°26'03.5&quot;N 78°26'58.7&quot;E&#10;RAJESH KUMAR&#9;9812345678&#9;&#9;Near Ram Mandir, Kompally" style="min-height:220px;font-family:monospace;font-size:13px"></textarea>
+    <div id="impResult" class="sub" style="margin-top:8px"></div>
+    <div class="foot"><button class="cancel" onclick="closeModal('importBg')">Cancel</button><button class="ok" onclick="runImport()">Import</button></div>
+  </div>
+</div>
+
 <!-- Delivery staff modal -->
 <div class="modal-bg" id="execsBg">
   <div class="modal">
@@ -746,6 +757,7 @@ function renderCustomers(){
         <h2>👥 Customers</h2>
         <div class="acts">
           <button class="mini" onclick="openAddCustomer()">+ Add customer</button>
+          <button class="mini" style="background:#2c6e49" onclick="openImport()">⬆ Import from sheet</button>
           <input id="cSearch" placeholder="Search name / number" oninput="renderCustomersTable()" style="padding:6px 10px;border:1px solid var(--bd);border-radius:6px;font-size:13px"/>
           <button class="linkbtn" onclick="loadCustomers()">↻ Refresh</button>
         </div>
@@ -770,6 +782,26 @@ function renderCustomersTable(){
       <td style="white-space:nowrap"><button class="mini" onclick="editCustomer('${c.waId}')">Edit</button> <button class="mini" style="background:#c0392b" onclick="deleteCustomer('${c.waId}')">Delete</button></td>
     </tr>`).join('')
   }</tbody></table>`;
+}
+function openImport(){ document.getElementById('impData').value=''; document.getElementById('impResult').textContent=''; document.getElementById('importBg').style.display='flex'; }
+async function runImport(){
+  const raw=document.getElementById('impData').value||'';
+  const lines=raw.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+  const rows=[];
+  for(const line of lines){
+    const parts=line.split('\t').length>1 ? line.split('\t') : line.split(',');
+    const name=(parts[0]||'').trim();
+    if(/^name$/i.test(name)) continue; // skip header
+    rows.push({ name, mobile:(parts[1]||'').trim(), alternate:(parts[2]||'').trim(), location:(parts[3]||'').trim() });
+  }
+  if(!rows.length){ document.getElementById('impResult').textContent='Nothing to import — paste some rows first.'; return; }
+  document.getElementById('impResult').textContent=`Importing ${rows.length} rows…`;
+  try{
+    const r=await api('/api/import/customers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rows})});
+    const j=await r.json();
+    document.getElementById('impResult').innerHTML=`✅ Imported <b>${j.imported}</b> of ${j.total}. Skipped ${j.skipped} (bad/no phone). ${j.locMissing} had no location.`;
+    loadCustomers();
+  }catch(e){ document.getElementById('impResult').textContent='Import failed. Check the format and try again.'; }
 }
 let editingCustomer=null;
 function openAddCustomer(){
