@@ -4,7 +4,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, setMukcarePause, updateContact, getSetting, setSetting, getSettings, bumpNonOrderCount, saveMedia, getMedia, listContacts, createCustomer, deleteContact, getLatestImageMediaId, dbEnabled } from "./db.js";
 import { mukcareReply, classifyFeedback } from "./ai.js";
-import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, deleteOrder, createExec, listExecs, setExecActive, execHandoffMessage, getEvents, getOrderItems, setOrderItems, logEvent, setOrderBilling, getProcurement, lockProcurement, editProcurementVendor, deleteProcurementLine, addFeedback, listFeedback, feedbackCounts, markFeedbackHandled, ordersNeedingFeedbackRequest, markFeedbackRequested } from "./orders.js";
+import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, deleteOrder, createExec, listExecs, setExecActive, execHandoffMessage, getEvents, getOrderItems, setOrderItems, logEvent, setOrderBilling, getProcurement, lockProcurement, editProcurementVendor, deleteProcurementLine, addFeedback, listFeedback, feedbackCounts, markFeedbackHandled, ordersNeedingFeedbackRequest, markFeedbackRequested, normalizeProductName } from "./orders.js";
 import { sendTemplate, sendOrderReady, sendOrderDispatched, sendOrderReminder, sendBillSent, sendDeliveryAssignment } from "./templates.js";
 import { initCampaignsDb, sendCampaign, recordOptOut } from "./campaigns.js";
 import crypto from "crypto";
@@ -26,6 +26,8 @@ let PHONE_NUMBER_ID  = process.env.PHONE_NUMBER_ID || "";
 let WABA_ID          = process.env.WABA_ID || "";
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "";
 const ORDER_DELETE_PASSWORD = process.env.ORDER_DELETE_PASSWORD || "";
+// Shared secret the PROFITMAKER bridge program sends in the x-bridge-token header.
+const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || "";
 // Public base URL of this Render service, used to build media links (e.g. invoice PDFs).
 const PUBLIC_URL = (process.env.PUBLIC_URL || "https://mukesh-whatsapp.onrender.com").replace(/\/+$/, "");
 
@@ -650,7 +652,11 @@ app.post("/api/orders/:id/bill", requireAuth, async (req, res) => {
 
 // ---- Procurement (Place Orders) ----
 app.get("/api/place-orders", requireAuth, async (req, res) => {
-  try { res.json(await getProcurement()); }
+  try {
+    let stock = {};
+    try { stock = JSON.parse(await getSetting("erp_stock") || "{}"); } catch (e) {}
+    res.json(await getProcurement(stock));
+  }
   catch (err) { console.error("place-orders err", err); res.status(500).json({ error: String(err) }); }
 });
 app.post("/api/place-orders/lock", requireAuth, async (req, res) => {
@@ -700,6 +706,57 @@ async function sweepFeedbackRequests() {
   } finally { _fbSweeping = false; }
 }
 
+// ---- ERP bridge receiver (PROFITMAKER) ----
+// The small bridge program on the shop's billing PC POSTs here (token-auth).
+// Body: { stock?: {productName: qty}, bill?: {orderCode, billNo, amount, invoiceBase64, invoiceMime} }
+// On stock: cache it for the Place-Orders view. On bill: mark the order billed &
+// ready and send the customer the invoice PDF.
+app.post("/api/bridge/results", async (req, res) => {
+  if (!BRIDGE_TOKEN || req.header("x-bridge-token") !== BRIDGE_TOKEN) return res.status(401).json({ error: "bad bridge token" });
+  try {
+    const { stock, bill } = req.body || {};
+    let stockSaved = 0, billed = null;
+
+    if (stock && typeof stock === "object") {
+      const norm = {};
+      for (const [name, qty] of Object.entries(stock)) { const k = normalizeProductName(name); if (k) norm[k] = Number(qty) || 0; }
+      await setSetting("erp_stock", JSON.stringify(norm));
+      stockSaved = Object.keys(norm).length;
+    }
+
+    if (bill && bill.orderCode) {
+      const order = (await listOrders({ limit: 100000 })).find(o => o.order_code === bill.orderCode);
+      if (!order) return res.json({ ok: true, stockSaved, warning: `order ${bill.orderCode} not found` });
+      let billMediaId = null;
+      if (bill.invoiceBase64) {
+        try { billMediaId = await saveMedia({ mime: bill.invoiceMime || "application/pdf", buffer: Buffer.from(bill.invoiceBase64, "base64") }); } catch (e) {}
+      }
+      const isDelivery = order.fulfillment === "delivery";
+      let distanceKm = null, deliveryFee = null, deliveryFeePending = null;
+      if (isDelivery) {
+        const contact = order.wa_id ? await getConversation(order.wa_id).catch(() => null) : null;
+        const q = await computeDeliveryQuote(contact?.locationLat, contact?.locationLng, bill.amount);
+        distanceKm = q.distanceKm; deliveryFee = q.fee; deliveryFeePending = q.pending;
+      }
+      billed = await setOrderBilling(order.id, {
+        billNo: bill.billNo || null, orderValue: bill.amount != null ? Number(bill.amount) : null,
+        billMediaId, distanceKm, deliveryFee, deliveryFeePending, fulfilment: order.fulfillment
+      });
+      const to = normalizePhone(order.wa_id || order.phone);
+      if (to) {
+        const name = order.customer_name || "there", code = order.order_code;
+        const msg = isDelivery
+          ? `Hi ${name}, your order ${code} is billed and ready for dispatch. Our delivery agent's details will follow shortly. Thank you! 🙏`
+          : `Hi ${name}, your order ${code} is billed and ready for pickup at Mukesh Medical. Thank you! 🙏`;
+        await sendWhatsAppText(to, msg, { bot: true }).catch(() => {});
+        if (billMediaId) await sendWhatsAppDocument(to, { link: mediaLink(billMediaId), filename: `Invoice-${code}.pdf`, caption: `Invoice ${code}` }, { bot: true }).catch(() => {});
+      }
+      console.log(`BRIDGE billed ${bill.orderCode} (bill ${bill.billNo || "-"})`);
+    }
+    res.json({ ok: true, stockSaved, billed: billed ? billed.order_code : null });
+  } catch (err) { console.error("bridge results err", err); res.status(500).json({ error: String(err) }); }
+});
+
 // Send the order details to the assigned delivery executive over WhatsApp.
 app.post("/api/orders/:id/notify-exec", requireAuth, async (req, res) => {
   try {
@@ -745,6 +802,51 @@ app.post("/api/customers/:waId", requireAuth, async (req, res) => {
   const { name, address, note } = req.body || {};
   try { await updateContact(req.params.waId, { name, address, note }); res.json({ ok: true }); }
   catch (err) { console.error("customer edit err", err); res.status(500).json({ error: String(err) }); }
+});
+
+// ---- Retail import of existing customers (Name | Mobile | Alternate | Location) ----
+// Converts DMS coordinates to lat/lng, keeps map links / landmarks as text,
+// normalises phones to 91XXXXXXXXXX, upserts by phone (never duplicates), and
+// marks imported customers name_confirmed so MUKCARE skips KYC.
+function cleanName(s) { return String(s || "").replace(/\s+/g, " ").trim(); }
+function parseDMS(str) {
+  // e.g. 17°26'03.5"N 78°26'58.7"E  -> { lat, lng }
+  const re = /(\d+)[°º]\s*(\d+)['′]\s*([\d.]+)["″]?\s*([NSEW])/gi;
+  const found = []; let m;
+  while ((m = re.exec(str)) !== null) {
+    let dec = Number(m[1]) + Number(m[2]) / 60 + Number(m[3]) / 3600;
+    const hemi = m[4].toUpperCase();
+    if (hemi === "S" || hemi === "W") dec = -dec;
+    found.push({ dec, hemi });
+  }
+  if (found.length < 2) return null;
+  const lat = found.find(f => f.hemi === "N" || f.hemi === "S");
+  const lng = found.find(f => f.hemi === "E" || f.hemi === "W");
+  if (!lat || !lng) return null;
+  return { lat: Math.round(lat.dec * 1e6) / 1e6, lng: Math.round(lng.dec * 1e6) / 1e6 };
+}
+app.post("/api/import/customers", requireAuth, async (req, res) => {
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  let imported = 0, skipped = 0, locMissing = 0;
+  const errors = [];
+  for (const r of rows) {
+    try {
+      const name = cleanName(r.name || r.Name);
+      const phone = normalizePhone(r.mobile || r.Mobile || r.phone);
+      if (!phone || phone.length < 11) { skipped++; continue; }
+      const alt = normalizePhone(r.alternate || r.Alternate || r.alt) || null;
+      const locRaw = String(r.location || r.Location || "").trim();
+      const fields = { name: name || null, source: "retail_import", nameConfirmed: true, alternateNumber: alt };
+      const dms = locRaw ? parseDMS(locRaw) : null;
+      if (dms) { fields.locationLat = dms.lat; fields.locationLng = dms.lng; fields.address = locRaw; }
+      else if (locRaw) { fields.address = locRaw; }
+      else { locMissing++; }
+      await createCustomer({ phone, name: name || phone });
+      await updateContact(phone, fields);
+      imported++;
+    } catch (e) { errors.push(String(e)); }
+  }
+  res.json({ ok: true, imported, skipped, locMissing, total: rows.length, errors: errors.slice(0, 5) });
 });
 // Delete a customer record (and their chat history). Operated by staff.
 app.post("/api/customers/:waId/delete", requireAuth, async (req, res) => {
