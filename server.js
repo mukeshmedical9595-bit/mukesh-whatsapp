@@ -12,7 +12,7 @@ import crypto from "crypto";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 // Keep the raw request body so we can verify Meta's X-Hub-Signature-256 on the webhook.
-app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
+app.use(express.json({ limit: "12mb", verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
 // ---- Config (from environment) ----
 const PORT           = process.env.PORT || 3000;
