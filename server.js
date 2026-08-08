@@ -238,14 +238,24 @@ function generateInvoicePdf(order, bill, seller = {}) {
       const L = 36, R = 559, W = R - L;
       const money = v => (Number(v) || 0).toFixed(2);
 
+      // Seller defaults (Mukesh Medical, Narayanaguda) — used when Settings are blank
+      const S = {
+        name: seller.name || "MUKESH MEDICAL",
+        address: seller.address || "3-5-170/1/8/1 & 170/1/8/2/4-1, Narayana Guda Main Road, Narayanaguda, Hyderabad, Telangana - 500029",
+        gstin: seller.gstin || "36AGMPK0923E1ZM",
+        dl: seller.dl || "TS/HYD/2018-35546 (20B, 21B, 20, 21)",
+        prop: seller.prop || "Prop: Rachana Kanodia",
+      };
+
       // Seller header
-      doc.fontSize(18).fillColor("#0b6b5e").text(seller.name || "Mukesh Medical", L, 36);
+      doc.fontSize(18).fillColor("#0b6b5e").text(S.name, L, 36);
       doc.fontSize(8.5).fillColor("#444");
-      doc.text(seller.address || "Narayanaguda, Hyderabad", L, doc.y);
+      doc.text(S.address, L, doc.y, { width: 320 });
+      if (S.prop) doc.text(S.prop, L, doc.y, { width: 320 });
       const sid = [];
-      if (seller.gstin) sid.push("GSTIN: " + seller.gstin);
-      if (seller.dl) sid.push("D.L.No: " + seller.dl);
-      if (sid.length) doc.text(sid.join("     "), L, doc.y);
+      if (S.gstin) sid.push("GSTIN: " + S.gstin);
+      if (S.dl) sid.push("D.L.No: " + S.dl);
+      if (sid.length) doc.text(sid.join("     "), L, doc.y, { width: 340 });
       // Title + meta (right)
       doc.fontSize(15).fillColor("#111").text("TAX INVOICE", L, 40, { width: W, align: "right" });
       const dt = bill.date ? new Date(bill.date) : new Date();
@@ -322,7 +332,7 @@ function generateInvoicePdf(order, bill, seller = {}) {
       ty += 6;
       doc.fontSize(8.5).fillColor("#111").text("Amount in words: " + amountInWords(net), L, ty, { width: W });
       ty = doc.y + 16;
-      doc.fontSize(8).fillColor("#777").text("E.&O.E.   This is a system-generated tax invoice from " + (seller.name || "Mukesh Medical") + ".", L, ty, { width: W, align: "center" });
+      doc.fontSize(8).fillColor("#777").text("E.&O.E.   This is a system-generated tax invoice from " + S.name + ".", L, ty, { width: W, align: "center" });
       doc.end();
     } catch (e) { reject(e); }
   });
