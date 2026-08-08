@@ -207,49 +207,122 @@ async function sendPaymentDetails(to) {
   return { ok: true };
 }
 
-// Build a simple invoice PDF (Buffer) from an order + the bill's line items.
-function generateInvoicePdf(order, bill) {
+// Indian amount-in-words (e.g. 1234 -> "One Thousand Two Hundred Thirty Four Rupees Only").
+function amountInWords(num) {
+  let n = Math.round(Number(num) || 0);
+  if (n === 0) return "Zero Rupees Only";
+  const a = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"];
+  const b = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
+  const two = x => x < 20 ? a[x] : (b[Math.floor(x / 10)] + (x % 10 ? " " + a[x % 10] : ""));
+  const three = x => x >= 100 ? (a[Math.floor(x / 100)] + " Hundred" + (x % 100 ? " " + two(x % 100) : "")) : two(x);
+  let out = "";
+  const cr = Math.floor(n / 10000000); n %= 10000000;
+  const la = Math.floor(n / 100000); n %= 100000;
+  const th = Math.floor(n / 1000); n %= 1000;
+  if (cr) out += three(cr) + " Crore ";
+  if (la) out += two(la) + " Lakh ";
+  if (th) out += two(th) + " Thousand ";
+  if (n) out += three(n);
+  return out.trim() + " Rupees Only";
+}
+
+// Build a full tax-invoice PDF (Buffer) from an order + the bill's totals & line items.
+function generateInvoicePdf(order, bill, seller = {}) {
   return new Promise((resolve, reject) => {
     try {
-      const doc = new PDFDocument({ size: "A4", margin: 40 });
+      const doc = new PDFDocument({ size: "A4", margin: 36 });
       const chunks = [];
       doc.on("data", c => chunks.push(c));
       doc.on("end", () => resolve(Buffer.concat(chunks)));
       doc.on("error", reject);
-      doc.fontSize(20).fillColor("#0b6b5e").text("Mukesh Medical");
-      doc.fontSize(9).fillColor("#555").text("Narayanaguda, Hyderabad");
-      doc.moveUp(2).fontSize(14).fillColor("#111").text("INVOICE", { align: "right" });
-      doc.moveDown(1.2);
-      doc.fontSize(10).fillColor("#111");
-      doc.text(`Order: ${order.order_code || ""}`);
-      if (bill.billNo) doc.text(`Bill No: ${bill.billNo}`);
-      doc.text(`Date: ${new Date().toLocaleString("en-IN")}`);
-      doc.text(`Customer: ${order.customer_name || "-"}`);
-      if (order.phone || order.wa_id) doc.text(`Phone: ${order.phone || order.wa_id}`);
-      doc.moveDown(0.8);
+      const L = 36, R = 559, W = R - L;
+      const money = v => (Number(v) || 0).toFixed(2);
+
+      // Seller header
+      doc.fontSize(18).fillColor("#0b6b5e").text(seller.name || "Mukesh Medical", L, 36);
+      doc.fontSize(8.5).fillColor("#444");
+      doc.text(seller.address || "Narayanaguda, Hyderabad", L, doc.y);
+      const sid = [];
+      if (seller.gstin) sid.push("GSTIN: " + seller.gstin);
+      if (seller.dl) sid.push("D.L.No: " + seller.dl);
+      if (sid.length) doc.text(sid.join("     "), L, doc.y);
+      // Title + meta (right)
+      doc.fontSize(15).fillColor("#111").text("TAX INVOICE", L, 40, { width: W, align: "right" });
+      const dt = bill.date ? new Date(bill.date) : new Date();
+      doc.fontSize(9).fillColor("#111");
+      doc.text("Bill No: " + (bill.billNo || "-"), L, 64, { width: W, align: "right" });
+      doc.text("Date: " + dt.toLocaleDateString("en-IN"), L, 76, { width: W, align: "right" });
+      doc.text("Order: " + (order.order_code || ""), L, 88, { width: W, align: "right" });
+      doc.moveTo(L, 106).lineTo(R, 106).strokeColor("#bbbbbb").stroke();
+
+      // Buyer
+      doc.fontSize(9).fillColor("#0b6b5e").text("Bill To", L, 112);
+      doc.fontSize(9.5).fillColor("#111").text(order.customer_name || "-", L, 124);
+      if (order.phone || order.wa_id) doc.fontSize(9).text("Phone: " + (order.phone || order.wa_id), L, doc.y);
+      if (order.address) doc.fontSize(8.5).fillColor("#555").text(String(order.address).slice(0, 95), L, doc.y);
+
+      // Items table header
+      let ty = 160;
+      const cols = [
+        { t: "Product", x: L, w: 152, a: "left" },
+        { t: "Batch", x: 190, w: 50, a: "left" },
+        { t: "Exp", x: 242, w: 34, a: "left" },
+        { t: "Qty", x: 278, w: 26, a: "right" },
+        { t: "Free", x: 306, w: 26, a: "right" },
+        { t: "MRP", x: 334, w: 44, a: "right" },
+        { t: "Rate", x: 380, w: 44, a: "right" },
+        { t: "Dis%", x: 426, w: 32, a: "right" },
+        { t: "GST%", x: 460, w: 32, a: "right" },
+        { t: "Amount", x: 494, w: 65, a: "right" },
+      ];
+      doc.rect(L, ty - 3, W, 15).fill("#0b6b5e");
+      doc.fillColor("#ffffff").fontSize(8);
+      cols.forEach(c => doc.text(c.t, c.x, ty, { width: c.w, align: c.a }));
+      ty += 16;
+      doc.fillColor("#111").fontSize(8);
       const items = Array.isArray(bill.items) ? bill.items : [];
-      let y = doc.y;
-      doc.fontSize(10).fillColor("#0b6b5e");
-      doc.text("Item", 40, y); doc.text("Qty", 340, y); doc.text("Rate", 400, y); doc.text("Amount", 480, y);
-      doc.moveTo(40, doc.y + 2).lineTo(555, doc.y + 2).strokeColor("#cccccc").stroke();
-      doc.fillColor("#111");
-      let total = 0;
       for (const it of items) {
-        y = doc.y + 6;
-        const amt = Number(it.value != null ? it.value : (Number(it.rate || 0) * Number(it.qty || 0)));
-        total += amt;
-        doc.text(String(it.name || "").slice(0, 46), 40, y, { width: 290 });
-        doc.text(String(it.qty ?? ""), 340, y);
-        doc.text(it.rate != null ? Number(it.rate).toFixed(2) : "", 400, y);
-        doc.text(amt.toFixed(2), 480, y);
+        if (ty > 715) { doc.addPage(); ty = 50; }
+        const vals = [
+          String(it.name || "").slice(0, 42), String(it.batch || ""), String(it.exp || ""),
+          it.qty != null ? String(it.qty) : "", it.free ? String(it.free) : "",
+          it.mrp != null ? money(it.mrp) : "", it.rate != null ? money(it.rate) : "",
+          it.disPer ? Number(it.disPer).toFixed(1) : "", it.gstPer != null ? String(Number(it.gstPer)) : "",
+          money(it.amount != null ? it.amount : (Number(it.rate || 0) * Number(it.qty || 0))),
+        ];
+        cols.forEach((c, i) => doc.text(vals[i], c.x, ty, { width: c.w, align: c.a }));
+        ty += 13;
       }
-      doc.moveDown(0.6);
-      doc.moveTo(40, doc.y + 2).lineTo(555, doc.y + 2).strokeColor("#cccccc").stroke();
-      doc.moveDown(0.6);
-      const net = bill.amount != null ? Number(bill.amount) : total;
-      doc.fontSize(12).fillColor("#111").text(`Net Amount:  Rs. ${net.toFixed(2)}`, { align: "right" });
-      doc.moveDown(2);
-      doc.fontSize(9).fillColor("#777").text("Thank you for choosing Mukesh Medical. System-generated invoice.", { align: "center" });
+      doc.moveTo(L, ty + 1).lineTo(R, ty + 1).strokeColor("#bbbbbb").stroke();
+      ty += 8;
+
+      // Totals block (right)
+      const lx = 358, vx = 494, vw = 65;
+      const trow = (label, val, bold) => {
+        doc.fontSize(bold ? 10.5 : 8.5).fillColor(bold ? "#0b6b5e" : "#111");
+        doc.text(label, lx, ty, { width: 130, align: "left" });
+        doc.text(money(val), vx, ty, { width: vw, align: "right" });
+        ty += bold ? 16 : 12;
+      };
+      if (bill.subTotal) trow("Sub Total", bill.subTotal);
+      if (bill.discount) trow("Discount (-)", bill.discount);
+      if (bill.schDis) trow("Scheme Dis (-)", bill.schDis);
+      const gv = bill.gstVals || [], ga = bill.gstAmts || [];
+      let anyGst = false;
+      for (let i = 1; i <= 5; i++) {
+        const tv = Number(gv[i] || 0), gg = Number(ga[i - 1] || 0);
+        if (tv > 0 && gg > 0) { anyGst = true; trow(`GST @${Math.round(gg / tv * 100)}%`, gg); }
+      }
+      if (!anyGst && bill.gstTotal) trow("GST", bill.gstTotal);
+      if (bill.rounding) trow("Round Off", bill.rounding);
+      doc.moveTo(lx, ty).lineTo(R, ty).strokeColor("#bbbbbb").stroke(); ty += 4;
+      const net = bill.net != null ? bill.net : bill.amount;
+      trow("NET AMOUNT", net, true);
+
+      ty += 6;
+      doc.fontSize(8.5).fillColor("#111").text("Amount in words: " + amountInWords(net), L, ty, { width: W });
+      ty = doc.y + 16;
+      doc.fontSize(8).fillColor("#777").text("E.&O.E.   This is a system-generated tax invoice from " + (seller.name || "Mukesh Medical") + ".", L, ty, { width: W, align: "center" });
       doc.end();
     } catch (e) { reject(e); }
   });
@@ -581,6 +654,10 @@ const SETTINGS_KEYS = {
   outletLng: "outlet_lng",
   outletAddress: "outlet_address",
   discountText: "discount_text",
+  sellerName: "seller_name",
+  sellerAddress: "seller_address",
+  sellerGstin: "seller_gstin",
+  sellerDl: "seller_dl",
 };
 app.get("/api/settings", requireAuth, async (req, res) => {
   try {
@@ -780,10 +857,14 @@ app.post("/api/bridge/results", async (req, res) => {
       if (bill.invoiceBase64) {
         try { billMediaId = await saveMedia({ mime: bill.invoiceMime || "application/pdf", buffer: Buffer.from(bill.invoiceBase64, "base64") }); } catch (e) {}
       }
-      // No invoice attached? Generate one from the bill's line items so the customer gets a PDF.
+      // No invoice attached? Generate a full tax invoice from the bill data.
       if (!billMediaId) {
-        try { const pdf = await generateInvoicePdf(order, bill); billMediaId = await saveMedia({ mime: "application/pdf", buffer: pdf }); }
-        catch (e) { console.error("invoice pdf gen err", e); }
+        try {
+          const sc = await getSettings(["seller_name", "seller_address", "seller_gstin", "seller_dl"]);
+          const seller = { name: sc.seller_name || "Mukesh Medical", address: sc.seller_address || "Narayanaguda, Hyderabad", gstin: sc.seller_gstin, dl: sc.seller_dl };
+          const pdf = await generateInvoicePdf(order, bill, seller);
+          billMediaId = await saveMedia({ mime: "application/pdf", buffer: pdf });
+        } catch (e) { console.error("invoice pdf gen err", e); }
       }
       const isDelivery = order.fulfillment === "delivery";
       let distanceKm = null, deliveryFee = null, deliveryFeePending = null;
