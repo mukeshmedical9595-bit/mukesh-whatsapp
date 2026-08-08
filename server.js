@@ -943,6 +943,7 @@ const MUKCARE_TEMPLATE_DEFS = [
 
 app.post("/api/admin/create-templates", requireAuth, async (req, res) => {
   if (!ACCESS_TOKEN || !WABA_ID) return res.status(400).json({ error: "ACCESS_TOKEN and WABA_ID required" });
+  const lang = req.query.lang || "en_US"; // Meta prefers a full locale code
   const results = [];
   for (const t of MUKCARE_TEMPLATE_DEFS) {
     try {
@@ -950,12 +951,20 @@ app.post("/api/admin/create-templates", requireAuth, async (req, res) => {
         method: "POST",
         headers: { "Authorization": `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
         body: JSON.stringify({
-          name: t.name, language: "en", category: t.category,
+          name: t.name, language: lang, category: t.category,
           components: [{ type: "BODY", text: t.body, example: { body_text: [t.example] } }]
         })
       });
       const data = await r.json();
-      results.push({ name: t.name, ok: r.ok, status: data.status || (r.ok ? "submitted" : "error"), detail: r.ok ? undefined : (data.error?.message || data) });
+      const e = data.error || {};
+      // Treat "already exists" as success so re-runs are harmless.
+      const exists = /already exists/i.test(e.message || e.error_user_msg || "");
+      results.push({
+        name: t.name,
+        ok: r.ok || exists,
+        status: exists ? "exists" : (data.status || (r.ok ? "submitted" : "error")),
+        detail: (r.ok || exists) ? undefined : { message: e.message, userTitle: e.error_user_title, userMsg: e.error_user_msg, code: e.code, subcode: e.error_subcode }
+      });
     } catch (e) { results.push({ name: t.name, ok: false, detail: String(e) }); }
   }
   res.json({ results });
