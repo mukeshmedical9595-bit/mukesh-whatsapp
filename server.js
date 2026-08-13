@@ -4,7 +4,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, setMukcarePause, updateContact, getSetting, setSetting, getSettings, bumpNonOrderCount, saveMedia, getMedia, listContacts, createCustomer, deleteContact, getLatestImageMediaId, getContactByWa, normalizeAllNumbers, dbEnabled } from "./db.js";
 import { mukcareReply, classifyFeedback } from "./ai.js";
-import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, deleteOrder, createExec, listExecs, setExecActive, execHandoffMessage, getEvents, getOrderItems, setOrderItems, logEvent, setOrderBilling, getProcurement, lockProcurement, editProcurementVendor, deleteProcurementLine, addFeedback, listFeedback, feedbackCounts, markFeedbackHandled, ordersNeedingFeedbackRequest, markFeedbackRequested, normalizeProductName, addItems, latestActiveUnbilled } from "./orders.js";
+import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, deleteOrder, createExec, listExecs, setExecActive, execHandoffMessage, getEvents, getOrderItems, setOrderItems, logEvent, setOrderBilling, getProcurement, lockProcurement, editProcurementVendor, deleteProcurementLine, addFeedback, listFeedback, feedbackCounts, markFeedbackHandled, ordersNeedingFeedbackRequest, markFeedbackRequested, normalizeProductName, addItems, latestActiveUnbilled, lockBulk, snapshotToday, listSnapshots, getSnapshot } from "./orders.js";
 import { sendTemplate, sendOrderReady, sendOrderDispatched, sendOrderReminder, sendBillSent, sendDeliveryAssignment } from "./templates.js";
 import { initCampaignsDb, sendCampaign, recordOptOut } from "./campaigns.js";
 import crypto from "crypto";
@@ -762,9 +762,17 @@ app.post("/api/orders", requireAuth, async (req, res) => {
       items: Array.isArray(b.items) ? b.items : [],
       fulfillment: b.fulfillment || null,
       address: b.address || null,
+      patientName: b.patient || b.customerName || null,
       notes: b.notes || null,
       status: b.status || "new"
     });
+    // §4: persist the entered KYC to the customer DB (name/address + default patient).
+    if (b.saveKyc && nPhone) {
+      try {
+        await createCustomer({ phone: nPhone, name: b.customerName || null, address: b.address || null });
+        if (b.patient) await updateContact(nPhone, { defaultPatient: b.patient });
+      } catch (e) { console.error("kyc save err", e); }
+    }
     res.json({ ok: true, order });
   } catch (err) { console.error("order create err", err); res.status(500).json({ error: String(err) }); }
 });
@@ -829,9 +837,26 @@ app.get("/api/place-orders", requireAuth, async (req, res) => {
   try {
     let stock = {};
     try { stock = JSON.parse(await getSetting("erp_stock") || "{}"); } catch (e) {}
+    snapshotToday(stock).catch(() => {}); // §1: freeze/refresh today's snapshot for History
     res.json(await getProcurement(stock));
   }
   catch (err) { console.error("place-orders err", err); res.status(500).json({ error: String(err) }); }
+});
+app.post("/api/place-orders/lock-bulk", requireAuth, async (req, res) => {
+  try {
+    let stock = {};
+    try { stock = JSON.parse(await getSetting("erp_stock") || "{}"); } catch (e) {}
+    const { productNorms, vendor } = req.body || {};
+    res.json({ ok: true, ...(await lockBulk(productNorms || [], vendor || "", stock)) });
+  } catch (err) { console.error("lock-bulk err", err); res.status(400).json({ error: String(err) }); }
+});
+app.get("/api/place-orders/snapshots", requireAuth, async (req, res) => {
+  try { res.json(await listSnapshots()); }
+  catch (err) { res.status(500).json({ error: String(err) }); }
+});
+app.get("/api/place-orders/snapshots/:date", requireAuth, async (req, res) => {
+  try { res.json(await getSnapshot(req.params.date)); }
+  catch (err) { res.status(500).json({ error: String(err) }); }
 });
 app.post("/api/place-orders/lock", requireAuth, async (req, res) => {
   try {

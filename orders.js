@@ -23,6 +23,7 @@ const mem = {
   events: [],       // { id, order_id, kind, detail, created_at }
   orderItems: [],   // { id, order_id, ... }
   procurement: [],  // procurement_lines
+  snapshots: [],    // §1: { snapshot_date, data, created_at, updated_at }
   feedback: [],     // feedback rows
   prescriptions: [],
   learning: [],
@@ -136,6 +137,14 @@ export async function initOrders() {
       vendor        TEXT,
       contributing  JSONB,
       placed_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    -- §1: frozen daily history of the Place Orders view (one row per IST day).
+    CREATE TABLE IF NOT EXISTS place_order_snapshots (
+      snapshot_date DATE PRIMARY KEY,
+      data          JSONB,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
     );
 
     -- Customer feedback captured after an order, with AI sentiment.
@@ -612,6 +621,14 @@ function parseQty(text) {
   const m = String(text ?? "").match(/(\d+(?:\.\d+)?)/);
   return m ? Number(m[1]) : 1;
 }
+// §1: IST calendar date (YYYY-MM-DD) for a Date, and "is this ts today in IST".
+function istDateStr(d = new Date()) {
+  return new Date(d).toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+}
+function isTodayIST(ts) {
+  if (!ts) return false;
+  return istDateStr(new Date(ts)) === istDateStr(new Date());
+}
 
 // Read all procurement_lines (vendor-locked batches).
 export async function listProcurementLines() {
@@ -628,6 +645,7 @@ export async function listProcurementLines() {
 export async function getProcurement(stock = {}) {
   const active = (await listOrders({ limit: 100000 })).filter(
     o => !o.deleted && ["new", "billed_ready", "billed_dispatched"].includes(o.status)
+         && isTodayIST(o.created_at)   // §1: live list shows only TODAY's orders (IST)
   );
   const agg = {}; // norm -> { product_name, totalOrdered, contributing:[] }
   for (const o of active) {
@@ -642,8 +660,8 @@ export async function getProcurement(stock = {}) {
       agg[norm].contributing.push({ orderId: o.id, orderCode: o.order_code, customer: o.customer_name || o.phone || "-", qty: it.qty || String(q) });
     }
   }
-  // Subtract already-placed (vendor-locked) quantities.
-  const lines = await listProcurementLines();
+  // Subtract already-placed (vendor-locked) quantities. §1: today's placed only.
+  const lines = (await listProcurementLines()).filter(l => isTodayIST(l.placed_at));
   const placedByNorm = {};
   for (const l of lines) placedByNorm[l.product_norm] = (placedByNorm[l.product_norm] || 0) + Number(l.qty_placed || 0);
 
@@ -690,6 +708,65 @@ export async function editProcurementVendor(id, vendor) {
 export async function deleteProcurementLine(id) {
   if (pool) { await pool.query(`DELETE FROM procurement_lines WHERE id = $1`, [id]); }
   else { const i = mem.procurement.findIndex(l => l.id === Number(id)); if (i >= 0) mem.procurement.splice(i, 1); }
+}
+
+// §1: bulk-lock several products as placed at once (vendor optional).
+export async function lockBulk(productNorms = [], vendor = "", stock = {}) {
+  const results = [];
+  for (const pn of productNorms) {
+    try { await lockProcurement(pn, vendor || null, stock); results.push({ product_norm: pn, ok: true }); }
+    catch (e) { results.push({ product_norm: pn, ok: false, error: String(e.message || e) }); }
+  }
+  return { placed: results.filter(r => r.ok).length, results };
+}
+
+// §1: upsert TODAY's snapshot (IST) with the current view; past days stay frozen.
+export async function snapshotToday(stock = {}) {
+  const { pending, available, placed } = await getProcurement(stock);
+  const data = { pending, available, placed };
+  if (pool) {
+    await pool.query(
+      `INSERT INTO place_order_snapshots (snapshot_date, data, updated_at)
+       VALUES ((now() AT TIME ZONE 'Asia/Kolkata')::date, $1::jsonb, now())
+       ON CONFLICT (snapshot_date) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
+      [JSON.stringify(data)]
+    );
+    return;
+  }
+  const today = istDateStr();
+  const ex = mem.snapshots.find(s => s.snapshot_date === today);
+  if (ex) { ex.data = data; ex.updated_at = new Date(); }
+  else mem.snapshots.push({ snapshot_date: today, data, created_at: new Date(), updated_at: new Date() });
+}
+
+// §1: per-day history rows with counts.
+export async function listSnapshots() {
+  if (pool) {
+    const { rows } = await pool.query(
+      `SELECT snapshot_date, updated_at,
+         COALESCE(jsonb_array_length(data->'pending'), 0)   AS to_place_count,
+         COALESCE(jsonb_array_length(data->'available'), 0) AS available_count,
+         COALESCE(jsonb_array_length(data->'placed'), 0)    AS placed_count
+       FROM place_order_snapshots ORDER BY snapshot_date DESC LIMIT 180`
+    );
+    return rows;
+  }
+  return mem.snapshots.slice().sort((a, b) => (a.snapshot_date < b.snapshot_date ? 1 : -1)).map(s => ({
+    snapshot_date: s.snapshot_date, updated_at: s.updated_at,
+    to_place_count: (s.data.pending || []).length,
+    available_count: (s.data.available || []).length,
+    placed_count: (s.data.placed || []).length,
+  }));
+}
+
+// §1: one frozen day's data.
+export async function getSnapshot(date) {
+  if (pool) {
+    const { rows } = await pool.query(
+      `SELECT snapshot_date, data, updated_at FROM place_order_snapshots WHERE snapshot_date = $1`, [date]);
+    return rows[0] || null;
+  }
+  return mem.snapshots.find(s => s.snapshot_date === date) || null;
 }
 
 // ---- Feedback ----

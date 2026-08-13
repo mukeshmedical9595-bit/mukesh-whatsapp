@@ -182,11 +182,12 @@
   <div class="modal">
     <h2>New order</h2>
     <p>Record a walk-in or phone order manually. (WhatsApp updates only reach customers who messaged us.)</p>
-    <div class="rowf"><input id="noName" placeholder="Customer / patient name"/><input id="noPhone" placeholder="Phone e.g. 9199…"/></div>
+    <div class="rowf"><input id="noName" placeholder="Customer / patient name"/><input id="noPhone" placeholder="Phone e.g. 9199…" onblur="lookupCustomer()"/></div>
+    <div class="rowf" style="margin-top:8px"><input id="noPatient" placeholder="Patient name (who is it for)"/></div>
     <textarea id="noItems" placeholder="One item per line:  DOLO 650 - 3 strips"></textarea>
     <div class="rowf" style="margin-top:8px">
-      <select id="noFulfil"><option value="pickup">Store pickup</option><option value="delivery">Home delivery</option></select>
-      <input id="noAddr" placeholder="Delivery address (if delivery)"/>
+      <select id="noFulfil" onchange="onFulfilChange()"><option value="pickup">Store pickup</option><option value="delivery">Home delivery</option></select>
+      <input id="noAddr" placeholder="Address (optional)"/>
     </div>
     <div class="foot"><button class="cancel" onclick="closeModal('newOrderBg')">Cancel</button><button class="ok" onclick="saveNewOrder()">Create order</button></div>
   </div>
@@ -662,11 +663,16 @@ async function openOrderDetail(id){
         <div><b>Date:</b> ${new Date(o.created_at).toLocaleString()}</div>
         <div><b>Customer:</b> ${esc(o.customer_name||'—')} (${esc(o.phone||'')})</div>
         <div><b>Fulfilment:</b> ${o.fulfillment==='delivery'?'🛵 Home delivery':'🏪 Store pickup'}</div>
-        ${o.address?`<div><b>Address:</b> ${esc(o.address)}</div>`:''}
+        ${o.fulfillment==='delivery'?`
+          <div style="margin-top:6px;padding:8px 10px;border:1px solid var(--bd);border-radius:8px;background:#f8fbfb">
+            <div><b>📍 Delivery:</b> <a href="https://maps.google.com/?q=${(o.delivery_lat!=null&&o.delivery_lng!=null)?`${o.delivery_lat},${o.delivery_lng}`:encodeURIComponent(o.address||'')}" target="_blank" rel="noopener">Open map</a></div>
+            ${o.address?`<div><b>Address:</b> ${esc(o.address)}</div>`:''}
+            ${o.distance_km!=null?`<div><b>Distance:</b> ${esc(o.distance_km)} km</div>`:''}
+            <div><b>Delivery fee:</b> ${o.delivery_fee_pending?'Pending (staff to confirm)':(o.delivery_fee?('₹'+esc(o.delivery_fee)):'Free delivery')}</div>
+          </div>` : (o.address?`<div><b>Address:</b> ${esc(o.address)}</div>`:'')}
         <div><b>Status:</b> ${esc(OSTATUS_LABELS[o.status]||o.status||'')}</div>
         ${o.bill_no?`<div><b>Bill no:</b> ${esc(o.bill_no)}</div>`:''}
         ${o.order_value!=null?`<div><b>Order value:</b> ₹${esc(o.order_value)}</div>`:''}
-        ${(o.fulfillment==='delivery'&&o.distance_km!=null)?`<div><b>Distance:</b> ${esc(o.distance_km)} km${o.delivery_fee!=null?` · fee ₹${esc(o.delivery_fee)}`:''}${o.delivery_fee_pending?' (staff to confirm)':''}</div>`:''}
         <div style="margin-top:6px"><b>Items:</b><ul style="margin:4px 0 0 18px">${items}</ul></div>
         ${o.notes?`<div style="margin-top:6px"><b>Notes:</b> ${esc(o.notes)}</div>`:''}
         ${billForm}
@@ -720,16 +726,28 @@ async function assignExecToSelected(){
 async function notifyExec(id){ try{ const r=await api('/api/orders/'+id+'/notify-exec',{method:'POST'}); const j=await r.json(); flash(j.ok?'Sent to delivery staff':'Failed: '+(j.error||'')); }catch(e){} }
 
 function openNewOrder(){ document.getElementById('newOrderBg').style.display='flex'; }
+function onFulfilChange(){ const d=document.getElementById('noFulfil').value==='delivery'; document.getElementById('noAddr').placeholder = d?'Delivery address':'Address (optional)'; }
+async function lookupCustomer(){
+  const wa=(document.getElementById('noPhone').value||'').trim(); if(!wa) return;
+  try{
+    const j=await (await api('/api/customers/by-number/'+encodeURIComponent(wa))).json();
+    const c=j&&j.customer; if(!c) return;
+    const set=(id,v)=>{ const el=document.getElementById(id); if(el && !el.value && v) el.value=v; };
+    set('noName', c.name); set('noPatient', c.defaultPatient); set('noAddr', c.address);
+    flash('Autofilled from saved customer');
+  }catch(e){}
+}
 function closeModal(id){ document.getElementById(id).style.display='none'; }
 async function saveNewOrder(){
   const name=document.getElementById('noName').value.trim();
   const phone=document.getElementById('noPhone').value.trim();
+  const patient=document.getElementById('noPatient').value.trim();
   const items=document.getElementById('noItems').value.split('\n').map(l=>l.trim()).filter(Boolean).map(l=>{ const p=l.split(/\s*[-–]\s*/); return {name:p[0], qty:p.slice(1).join(' ')||''}; });
   const fulfillment=document.getElementById('noFulfil').value;
   const address=document.getElementById('noAddr').value.trim();
   if(!name){ alert('Please enter a customer name.'); return; }
-  try{ await api('/api/orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customerName:name,phone,items,fulfillment,address})});
-    ['noName','noPhone','noItems','noAddr'].forEach(i=>document.getElementById(i).value='');
+  try{ await api('/api/orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customerName:name,phone,patient,items,fulfillment,address,saveKyc:true})});
+    ['noName','noPhone','noPatient','noItems','noAddr'].forEach(i=>document.getElementById(i).value='');
     closeModal('newOrderBg'); flash('Order created'); loadOrders();
   }catch(e){}
 }
@@ -979,18 +997,21 @@ async function saveSettings(){
 /* ---------- place orders (procurement) ---------- */
 let PLACE=null, PLACE_TAB='pending';
 function renderPlace(){
+  const c = PLACE ? {pending:(PLACE.pending||[]).length, available:(PLACE.available||[]).length, all:((PLACE.pending||[]).length+(PLACE.available||[]).length), placed:(PLACE.placed||[]).length} : {pending:0,available:0,all:0,placed:0};
   document.getElementById('app').innerHTML = `
     <div class="orders">
       <div class="bar">
         <h2>🧾 Place Orders</h2>
         <div class="acts">
-          <button class="mini" style="background:#2c6e49" onclick="exportPlace()">⬇ Export</button>
+          <button class="mini" onclick="toggleHistory()">🕘 History</button>
+          <button class="mini" style="background:#2c6e49" onclick="exportPlace()">⬇ Download current view</button>
           <button class="linkbtn" onclick="loadPlace()">↻ Refresh</button>
         </div>
       </div>
       <div class="tabs" style="border:0;padding:0 0 12px">
-        ${['pending','available','placed'].map(t=>`<div class="tab ${PLACE_TAB===t?'active':''}" onclick="setPlaceTab('${t}')">${({pending:'To place',available:'Available',placed:'Already placed'})[t]}</div>`).join('')}
+        ${['pending','available','all','placed'].map(t=>`<div class="tab ${PLACE_TAB===t?'active':''}" onclick="setPlaceTab('${t}')">${({pending:'To place',available:'Available',all:'All Orders',placed:'Already placed'})[t]} (${c[t]})</div>`).join('')}
       </div>
+      <div id="placeHistory" style="display:none;margin-bottom:12px"></div>
       <div id="placeBody"><div class="empty">Loading…</div></div>
     </div>`;
 }
@@ -1012,10 +1033,19 @@ function renderPlaceBody(){
     }</tbody></table>`;
     return;
   }
-  const rows = PLACE_TAB==='pending' ? (PLACE.pending||[]) : (PLACE.available||[]);
-  if(!rows.length){ body.innerHTML=`<div class="empty">${PLACE_TAB==='pending'?'Nothing to place — all demand is covered.':'No products fully covered by stock yet.'}</div>`; return; }
-  body.innerHTML=`<table class="otable"><thead><tr><th>Product</th><th>Ordered</th><th>In stock</th><th>Placed</th><th>To place</th>${PLACE_TAB==='pending'?'<th>Vendor / lock</th>':''}<th></th></tr></thead><tbody>${
+  const rows = PLACE_TAB==='available' ? (PLACE.available||[])
+             : PLACE_TAB==='all' ? [...(PLACE.pending||[]), ...(PLACE.available||[])]
+             : (PLACE.pending||[]);
+  if(!rows.length){ body.innerHTML=`<div class="empty">${PLACE_TAB==='pending'?'Nothing to place — all demand is covered.':'Nothing here yet.'}</div>`; return; }
+  const canLock = PLACE_TAB==='pending';
+  const bulkBar = canLock ? `<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+      <label class="sub"><input type="checkbox" id="pallchk" onchange="togglePlaceAll(this.checked)"/> Select all</label>
+      <input type="text" id="bulkVendor" placeholder="vendor (optional)" style="padding:5px 8px;border:1px solid var(--bd);border-radius:6px;width:160px"/>
+      <button class="mini" onclick="markPlacedBulk()">Mark selected placed</button>
+    </div>` : '';
+  body.innerHTML = bulkBar + `<table class="otable"><thead><tr>${canLock?'<th></th>':''}<th>Product</th><th>Ordered</th><th>In stock</th><th>Placed</th><th>To place</th>${canLock?'<th>Vendor / lock</th>':''}<th></th></tr></thead><tbody>${
     rows.map((r,i)=>`<tr>
+      ${canLock?`<td><input type="checkbox" class="pchk" value="${esc(r.product_norm)}"/></td>`:''}
       <td><b>${esc(r.product_name)}</b><br><span class="sub" style="cursor:pointer" onclick="togglePlaceRow(${i})">${r.contributing.length} order(s) ▾</span>
         <div id="pc_${i}" style="display:none;margin-top:4px">${r.contributing.map(c=>`<div class="sub">${esc(c.orderCode||'')} · ${esc(c.customer)} · ${esc(c.qty)}</div>`).join('')}</div>
       </td>
@@ -1023,12 +1053,49 @@ function renderPlaceBody(){
       <td>${esc(r.in_stock)}</td>
       <td>${esc(r.already_placed)}</td>
       <td><b>${esc(r.to_place)}</b></td>
-      ${PLACE_TAB==='pending'?`<td><input type="text" id="v_${i}" placeholder="vendor" style="padding:5px 8px;border:1px solid var(--bd);border-radius:6px;width:120px"/> <button class="mini" onclick="lockProduct('${esc(r.product_norm)}',${i})">Lock</button></td>`:''}
-      <td>${PLACE_TAB==='pending'?'<span class="badge pause">To place</span>':'<span class="badge booked">Available</span>'}</td>
+      ${canLock?`<td><input type="text" id="v_${i}" placeholder="vendor" style="padding:5px 8px;border:1px solid var(--bd);border-radius:6px;width:120px"/> <button class="mini" onclick="lockProduct('${esc(r.product_norm)}',${i})">Place</button></td>`:''}
+      <td>${r.to_place>0?'<span class="badge pause">To place</span>':'<span class="badge booked">Available</span>'}</td>
     </tr>`).join('')
   }</tbody></table>`;
 }
 function togglePlaceRow(i){ const e=document.getElementById('pc_'+i); if(e) e.style.display=e.style.display==='none'?'block':'none'; }
+function togglePlaceAll(on){ document.querySelectorAll('.pchk').forEach(c=>c.checked=on); }
+async function markPlacedBulk(){
+  const norms=[...document.querySelectorAll('.pchk:checked')].map(c=>c.value);
+  if(!norms.length){ alert('Tick at least one product.'); return; }
+  const vendor=(document.getElementById('bulkVendor')?.value||'').trim();
+  try{ const r=await (await api('/api/place-orders/lock-bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({productNorms:norms,vendor})})).json();
+    flash(`Marked ${r.placed||0} placed`); loadPlace();
+  }catch(e){ flash('Bulk place failed'); }
+}
+async function toggleHistory(){
+  const el=document.getElementById('placeHistory'); if(!el) return;
+  if(el.style.display!=='none'){ el.style.display='none'; return; }
+  el.style.display='block'; el.innerHTML='<div class="sub">Loading history…</div>';
+  try{
+    const days=await (await api('/api/place-orders/snapshots')).json();
+    if(!Array.isArray(days)||!days.length){ el.innerHTML='<div class="empty">No history yet.</div>'; return; }
+    el.innerHTML=`<table class="otable"><thead><tr><th>Day</th><th>To place</th><th>Available</th><th>Placed</th><th></th></tr></thead><tbody>${
+      days.map(d=>{ const date=String(d.snapshot_date).slice(0,10); return `<tr>
+        <td><b>${date}</b></td><td>${esc(d.to_place_count)}</td><td>${esc(d.available_count)}</td><td>${esc(d.placed_count)}</td>
+        <td><button class="mini" onclick="downloadSnapshot('${date}')">⬇ Download</button></td></tr>`; }).join('')
+    }</tbody></table>`;
+  }catch(e){ el.innerHTML='<div class="empty">Could not load history.</div>'; }
+}
+async function downloadSnapshot(date){
+  try{
+    const s=await (await api('/api/place-orders/snapshots/'+date)).json();
+    const data=(s&&s.data)||{};
+    const rows=[['Product','Ordered','In stock','Already placed','To place','Status','Vendor']];
+    (data.pending||[]).forEach(r=>rows.push([r.product_name,r.total_ordered,r.in_stock,r.already_placed,r.to_place,'To place','']));
+    (data.available||[]).forEach(r=>rows.push([r.product_name,r.total_ordered,r.in_stock,r.already_placed,r.to_place,'Available','']));
+    (data.placed||[]).forEach(l=>rows.push([l.product_name,l.total_ordered,l.stock_used,l.qty_placed,0,'Placed',l.vendor||'']));
+    const csv=rows.map(r=>r.map(csvCell).join(',')).join('\r\n');
+    const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+    a.download=`mukesh-place-orders-${date}.csv`; document.body.appendChild(a); a.click(); a.remove();
+    flash('Downloaded '+date);
+  }catch(e){ flash('Download failed'); }
+}
 async function lockProduct(norm,i){
   const vendor=(document.getElementById('v_'+i)?.value||'').trim();
   if(!vendor && !confirm('Lock this line without a vendor?')) return;
