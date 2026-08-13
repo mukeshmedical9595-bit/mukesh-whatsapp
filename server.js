@@ -924,7 +924,13 @@ app.post("/api/bridge/results", async (req, res) => {
     }
 
     if (bill && bill.orderCode) {
-      const order = (await listOrders({ limit: 100000 })).find(o => o.order_code === bill.orderCode);
+      // §6c: tolerant order-code match - ignore case + separators/spacing so a
+      // bill still links even if the code was typed as "MM 260808 001" or "mm260808001".
+      const _codeNorm = s => String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+      const _want = _codeNorm(bill.orderCode);
+      const _allOrders = await listOrders({ limit: 100000 });
+      const order = _allOrders.find(o => o.order_code === bill.orderCode)
+                 || _allOrders.find(o => _codeNorm(o.order_code) === _want);
       if (!order) return res.json({ ok: true, stockSaved, warning: `order ${bill.orderCode} not found` });
       let billMediaId = null;
       if (bill.invoiceBase64) {
@@ -1154,6 +1160,9 @@ const MUKCARE_TEMPLATE_DEFS = [
   { name: "promo_generic", category: "MARKETING",
     body: "Hi {{1}}, {{2}} Reply STOP to opt out. - Mukesh Medical",
     example: ["Rahul", "This week: 15% off on all health supplements!"] },
+  { name: "winback_offer", category: "MARKETING",
+    body: "Hi {{1}}, we've missed you at Mukesh Medical! It's been a while since your last order. Whenever you need medicines, just reply here - we offer up to 20% off and quick home delivery. Reply STOP to opt out.",
+    example: ["Rahul"] },
   { name: "delivery_assignment", category: "UTILITY",
     body: "New delivery assigned - order {{1}}. Customer: {{2}}, phone {{3}}. Deliver to: {{4}}. Items: {{5}}. Payment: collect on delivery unless paid at billing.",
     example: ["MM-260728-001", "Suresh Raina", "9876543210", "https://maps.google.com/?q=17.4,78.4", "DOLO 650 - 2 strips"] },
