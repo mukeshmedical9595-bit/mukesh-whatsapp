@@ -5,7 +5,7 @@ import { fileURLToPath } from "url";
 import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, setMukcarePause, updateContact, getSetting, setSetting, getSettings, bumpNonOrderCount, saveMedia, getMedia, listContacts, createCustomer, deleteContact, getLatestImageMediaId, getContactByWa, normalizeAllNumbers, dbEnabled } from "./db.js";
 import { mukcareReply, classifyFeedback } from "./ai.js";
 import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, deleteOrder, createExec, listExecs, setExecActive, execHandoffMessage, getEvents, getOrderItems, setOrderItems, logEvent, setOrderBilling, getProcurement, lockProcurement, editProcurementVendor, deleteProcurementLine, addFeedback, listFeedback, feedbackCounts, markFeedbackHandled, ordersNeedingFeedbackRequest, markFeedbackRequested, normalizeProductName, addItems, latestActiveUnbilled, lockBulk, snapshotToday, listSnapshots, getSnapshot } from "./orders.js";
-import { sendTemplate, sendOrderReady, sendOrderDispatched, sendOrderReminder, sendBillSent, sendDeliveryAssignment } from "./templates.js";
+import { sendTemplate, sendOrderReady, sendOrderDispatched, sendOrderReminder, sendBillSent, sendDeliveryAssignment, sendBilledReadyDelivery } from "./templates.js";
 import { initCampaignsDb, sendCampaign, recordOptOut } from "./campaigns.js";
 import crypto from "crypto";
 import PDFDocument from "pdfkit";
@@ -825,8 +825,15 @@ app.post("/api/orders/:id/bill", requireAuth, async (req, res) => {
       const msg = isDelivery
         ? `Hi ${name}, your order ${code} is ready. Here is your invoice, please check. 🙏 Our delivery agent's details will be shared with you shortly.`
         : `Hi ${name}, your order ${code} is billed and ready for pickup at Mukesh Medical. Here is your invoice, please check. Thank you! 🙏`;
-      await sendWhatsAppText(to, msg, { bot: true }).catch(() => {});
-      if (billMediaId) await sendWhatsAppDocument(to, { link: mediaLink(billMediaId), filename: `Invoice-${code}.pdf`, caption: `Invoice ${code}` }, { bot: true }).catch(() => {});
+      if (await within24hWindow(to)) {
+        await sendWhatsAppText(to, msg, { bot: true }).catch(() => {});
+        if (billMediaId) await sendWhatsAppDocument(to, { link: mediaLink(billMediaId), filename: `Invoice-${code}.pdf`, caption: `Invoice ${code}` }, { bot: true }).catch(() => {});
+      } else if (isDelivery && billMediaId) {
+        // §7: outside the 24h window - deliver the invoice via the approved document-header template.
+        await sendBilledReadyDelivery(to, { name, orderCode: code, docLink: mediaLink(billMediaId) }).catch(() => {});
+      } else {
+        await sendOrderReady(to, { name, orderCode: code }).catch(() => {}); // outside window, pickup/no-invoice
+      }
     }
     res.json({ ok: true, order: billed });
   } catch (err) { console.error("order bill err", err); res.status(500).json({ error: String(err) }); }
@@ -962,8 +969,15 @@ app.post("/api/bridge/results", async (req, res) => {
         const msg = isDelivery
           ? `Hi ${name}, your order ${code} is ready. Here is your invoice, please check. 🙏 Our delivery agent's details will be shared with you shortly.`
           : `Hi ${name}, your order ${code} is billed and ready for pickup at Mukesh Medical. Here is your invoice, please check. Thank you! 🙏`;
-        await sendWhatsAppText(to, msg, { bot: true }).catch(() => {});
-        if (billMediaId) await sendWhatsAppDocument(to, { link: mediaLink(billMediaId), filename: `Invoice-${code}.pdf`, caption: `Invoice ${code}` }, { bot: true }).catch(() => {});
+        if (await within24hWindow(to)) {
+          await sendWhatsAppText(to, msg, { bot: true }).catch(() => {});
+          if (billMediaId) await sendWhatsAppDocument(to, { link: mediaLink(billMediaId), filename: `Invoice-${code}.pdf`, caption: `Invoice ${code}` }, { bot: true }).catch(() => {});
+        } else if (isDelivery && billMediaId) {
+          // §7: outside the 24h window - deliver the invoice via the approved document-header template.
+          await sendBilledReadyDelivery(to, { name, orderCode: code, docLink: mediaLink(billMediaId) }).catch(() => {});
+        } else {
+          await sendOrderReady(to, { name, orderCode: code }).catch(() => {});
+        }
       }
       console.log(`BRIDGE billed ${bill.orderCode} (bill ${bill.billNo || "-"})`);
     }
@@ -1195,6 +1209,57 @@ app.post("/api/admin/create-templates", requireAuth, async (req, res) => {
     } catch (e) { results.push({ name: t.name, ok: false, detail: String(e) }); }
   }
   res.json({ results });
+});
+
+// ---- One-time: create the billed_ready_delivery template (DOCUMENT header) ----
+// Lets a delivery order's invoice reach the customer even OUTSIDE the 24h window.
+// A media-header template needs a sample document handle, obtained via Meta's
+// resumable upload API. Safe to re-run ("already exists" is treated as success).
+app.post("/api/admin/create-delivery-template", requireAuth, async (req, res) => {
+  if (!ACCESS_TOKEN || !WABA_ID || !APP_ID) return res.status(400).json({ error: "ACCESS_TOKEN, WABA_ID and APP_ID required" });
+  const lang = req.query.lang || "en_US";
+  try {
+    // 1) Build a small sample invoice PDF (reuses the real invoice generator).
+    const samplePdf = await generateInvoicePdf(
+      { order_code: "MM-000000-000", customer_name: "Sample Customer", fulfillment: "delivery" },
+      { billNo: "SAMPLE", date: new Date().toISOString(), subTotal: 100, net: 100,
+        items: [{ name: "Sample Medicine", batch: "B1", qty: 1, mrp: 100, rate: 100, gstPer: 12, amount: 100 }] },
+      {}
+    );
+    // 2) Resumable upload -> header handle.
+    const startRes = await fetch(`${GRAPH}/${APP_ID}/uploads?file_name=invoice.pdf&file_length=${samplePdf.length}&file_type=application%2Fpdf`, {
+      method: "POST", headers: { "Authorization": `Bearer ${ACCESS_TOKEN}` }
+    });
+    const startData = await startRes.json();
+    if (!startData.id) return res.status(500).json({ error: "upload session failed", detail: startData });
+    const upRes = await fetch(`${GRAPH}/${startData.id}`, {
+      method: "POST",
+      headers: { "Authorization": `OAuth ${ACCESS_TOKEN}`, "file_offset": "0", "Content-Type": "application/pdf" },
+      body: samplePdf
+    });
+    const upData = await upRes.json();
+    if (!upData.h) return res.status(500).json({ error: "sample upload failed", detail: upData });
+    // 3) Submit the template with a DOCUMENT header + body.
+    const r = await fetch(`${GRAPH}/${WABA_ID}/message_templates`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: "billed_ready_delivery", language: lang, category: "UTILITY",
+        components: [
+          { type: "HEADER", format: "DOCUMENT", example: { header_handle: [upData.h] } },
+          { type: "BODY",
+            text: "Hi {{1}}, your order {{2}} is ready. Please find your invoice attached, kindly check. Our delivery agent's details will be shared with you shortly. Thank you.",
+            example: { body_text: [["Rahul", "MM-260808-001"]] } }
+        ]
+      })
+    });
+    const data = await r.json();
+    const e = data.error || {};
+    const exists = /already exists/i.test(e.message || e.error_user_msg || "");
+    res.json({ ok: r.ok || exists, name: "billed_ready_delivery",
+      status: exists ? "exists" : (data.status || (r.ok ? "submitted" : "error")), id: data.id,
+      detail: (r.ok || exists) ? undefined : { message: e.message, userTitle: e.error_user_title, userMsg: e.error_user_msg, code: e.code, subcode: e.error_subcode } });
+  } catch (err) { console.error("create-delivery-template err", err); res.status(500).json({ error: String(err) }); }
 });
 
 // ---- Bulk broadcast (marketing templates) ----

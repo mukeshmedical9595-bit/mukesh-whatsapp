@@ -162,3 +162,36 @@ export async function sendDeliveryAssignment(to, { orderCode, customerName, phon
   const t = TEMPLATES.DELIVERY_ASSIGN;
   return sendTemplate(to, t.name, t.lang, [orderCode, customerName, phone, address, items]);
 }
+
+/**
+ * §7: Deliver a delivery order's invoice OUTSIDE the 24h window using the
+ * approved `billed_ready_delivery` template, which carries a DOCUMENT header
+ * so the actual invoice PDF is attached. Created in en_US (see the
+ * create-delivery-template route), so it must be sent with the same code.
+ */
+export async function sendBilledReadyDelivery(to, { name, orderCode, docLink, filename } = {}) {
+  const ACCESS_TOKEN = process.env.ACCESS_TOKEN || "";
+  const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || "";
+  if (!ACCESS_TOKEN || !PHONE_NUMBER_ID) return { ok: false, error: "ACCESS_TOKEN / PHONE_NUMBER_ID not set." };
+  if (!to || !docLink) return { ok: false, error: "to and docLink are required." };
+  const payload = {
+    messaging_product: "whatsapp", to, type: "template",
+    template: {
+      name: "billed_ready_delivery", language: { code: "en_US" },
+      components: [
+        { type: "header", parameters: [{ type: "document", document: { link: docLink, filename: filename || `Invoice-${orderCode || ""}.pdf` } }] },
+        { type: "body", parameters: [{ type: "text", text: String(name || "there") }, { type: "text", text: String(orderCode || "") }] }
+      ]
+    }
+  };
+  try {
+    const r = await fetch(`${GRAPH}/${PHONE_NUMBER_ID}/messages`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const data = await r.json();
+    if (!r.ok) { console.error("sendBilledReadyDelivery err", data); return { ok: false, error: data }; }
+    return { ok: true, id: data.messages?.[0]?.id, data };
+  } catch (err) { console.error("sendBilledReadyDelivery exception", err); return { ok: false, error: String(err) }; }
+}
