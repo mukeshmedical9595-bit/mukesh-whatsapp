@@ -199,8 +199,8 @@ export async function createOrder(data) {
     const { rows } = await pool.query(
       `INSERT INTO orders
          (order_code, wa_id, customer_name, phone, mode, items, prescription_url,
-          fulfillment, address, distance_km, delivery_fee, status, exec_id, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+          fulfillment, address, distance_km, delivery_fee, status, exec_id, notes, patient_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
        RETURNING *`,
       [
         orderCode,
@@ -217,6 +217,7 @@ export async function createOrder(data) {
         status,
         data.execId || null,
         data.notes || null,
+        data.patientName || null,
       ]
     );
     await logEvent(rows[0].id, "status", `Order created (${status})`);
@@ -316,6 +317,44 @@ export async function getOrderItems(orderId) {
     return rows;
   }
   return mem.orderItems.filter(i => i.order_id === Number(orderId));
+}
+
+// §3d: append items to an existing (not-yet-billed) order instead of opening a
+// duplicate. Keeps orders.items (JSONB) and order_items in sync, flags the order
+// needs_review, and logs an items_added event.
+export async function addItems(orderId, items = []) {
+  const o = await getOrder(orderId);
+  if (!o) return null;
+  const existing = Array.isArray(o.items) ? o.items : [];
+  const add = (items || [])
+    .map(it => ({ name: String(it.name || "").trim(), qty: it.qty != null ? String(it.qty) : (it.quantity != null ? String(it.quantity) : "") }))
+    .filter(x => x.name);
+  if (!add.length) return o;
+  const merged = existing.concat(add);
+  if (pool) {
+    await pool.query(`UPDATE orders SET items = $2, needs_review = TRUE, updated_at = now() WHERE id = $1`,
+      [orderId, JSON.stringify(merged)]);
+  } else {
+    o.items = merged; o.needs_review = true; o.updated_at = new Date();
+  }
+  await setOrderItems(orderId, merged);
+  await logEvent(orderId, "items_added", add.map(i => i.name + (i.qty && i.qty !== "1" ? " - " + i.qty : "")).join(", "));
+  return getOrder(orderId);
+}
+
+// §3d: the customer's most recent order still being prepared (status 'new',
+// not yet billed) - so a follow-up "add these too" appends instead of duplicating.
+export async function latestActiveUnbilled(waId) {
+  if (!waId) return null;
+  if (pool) {
+    const { rows } = await pool.query(
+      `SELECT id, order_code, items FROM orders
+        WHERE wa_id = $1 AND status = 'new' AND deleted = FALSE
+        ORDER BY created_at DESC LIMIT 1`, [waId]);
+    return rows[0] || null;
+  }
+  return mem.orders.filter(o => o.wa_id === waId && o.status === "new" && !o.deleted)
+    .sort((a, b) => b.created_at - a.created_at)[0] || null;
 }
 
 // filter: { status, waId, execId, limit, offset } - all optional

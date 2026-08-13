@@ -13,6 +13,20 @@ export const dbEnabled = Boolean(pool);
 // ---- Fallback in-memory store (used only when no DATABASE_URL) ----
 const mem = { contacts: {} }; // { wa_id: { wa_id, name, booked, human_control, updated, messages:[] } }
 
+// Normalise any phone number to standard 91XXXXXXXXXX (default country code 91).
+// Bare 10-digit -> prefix 91; leading 0 stripped; already 91/091 kept; longer -> 91+last10.
+// Shorter than 10 digits returned as-is (invalid, don't mangle).
+export function normPhone(input) {
+  const d = String(input || "").replace(/\D+/g, "");
+  if (!d) return "";
+  if (d.length === 10) return "91" + d;
+  if (d.length === 11 && d[0] === "0") return "91" + d.slice(1);
+  if (d.length === 12 && d.startsWith("91")) return d;
+  if (d.length === 13 && d.startsWith("091")) return d.slice(1);
+  if (d.length > 10) return "91" + d.slice(-10);
+  return d;
+}
+
 export async function initDb() {
   if (!pool) { console.warn("DATABASE_URL not set - running WITHOUT persistence (in-memory)."); return; }
   await pool.query(`
@@ -290,9 +304,78 @@ export async function listContacts() {
     .map(c => ({ waId: c.wa_id, name: c.name, phone: c.wa_id, address: c.address || "", note: c.note || "", booked: c.booked, spam: c.spam }));
 }
 
+// Flexible lookup by number: finds a saved contact regardless of stored format
+// (bare 10-digit vs 91XXXXXXXXXX). Read-only; returns the contact row or null.
+// Used by the manual-order form auto-fill and cross-format safety.
+export async function getContactByWa(input) {
+  const digits = String(input || "").replace(/\D+/g, "");
+  if (digits.length < 10) return null;
+  const last10 = digits.slice(-10);
+  const cands = [digits, last10, "91" + last10];
+  if (pool) {
+    const { rows } = await pool.query(
+      `SELECT wa_id, name, address, note, default_patient, location_lat, location_lng, alternate_number
+         FROM contacts WHERE wa_id = ANY($1::text[]) AND deleted = FALSE LIMIT 1`, [cands]);
+    const c = rows[0];
+    if (!c) return null;
+    return { waId: c.wa_id, name: c.name || "", address: c.address || "", note: c.note || "",
+      defaultPatient: c.default_patient || "", locationLat: c.location_lat, locationLng: c.location_lng,
+      alternateNumber: c.alternate_number || "" };
+  }
+  const c = Object.values(mem.contacts).find(x => cands.includes(x.wa_id) && !x.deleted);
+  if (!c) return null;
+  return { waId: c.wa_id, name: c.name || "", address: c.address || "", note: c.note || "",
+    defaultPatient: c.default_patient || "", locationLat: c.location_lat, locationLng: c.location_lng,
+    alternateNumber: c.alternate_number || "" };
+}
+
+// One-time cleanup: rewrite every stored wa_id to the 91XXXXXXXXXX form; when the
+// canonical number already exists, merge child rows into it and delete the dup.
+// Idempotent / safe to re-run. Exposed behind a password-gated POST route.
+export async function normalizeAllNumbers() {
+  if (!pool) return { total: 0, updated: 0, merged: 0, skipped: 0, errors: [] };
+  const { rows } = await pool.query(`SELECT wa_id FROM contacts WHERE deleted = FALSE`);
+  let updated = 0, merged = 0, skipped = 0; const errors = [];
+  const childTables = ["messages", "media", "orders", "feedback"];
+  for (const r of rows) {
+    try {
+      const canon = normPhone(r.wa_id);
+      if (!canon || canon === r.wa_id) { skipped++; continue; }
+      const dup = (await pool.query(
+        `SELECT wa_id FROM contacts WHERE wa_id = $1 AND wa_id <> $2`, [canon, r.wa_id])).rows[0];
+      // Ensure the canonical contact exists before repointing children (FK targets).
+      if (!dup) {
+        await pool.query(
+          `INSERT INTO contacts (wa_id, name, note, address, location_lat, location_lng,
+             alternate_number, default_patient, name_confirmed, source)
+           SELECT $1, name, note, address, location_lat, location_lng,
+             alternate_number, default_patient, name_confirmed, source
+           FROM contacts WHERE wa_id = $2
+           ON CONFLICT (wa_id) DO NOTHING`, [canon, r.wa_id]);
+      } else {
+        await pool.query(
+          `UPDATE contacts kept SET
+             name = COALESCE(NULLIF(kept.name,''), d.name),
+             address = COALESCE(kept.address, d.address),
+             note = COALESCE(kept.note, d.note),
+             location_lat = COALESCE(kept.location_lat, d.location_lat),
+             location_lng = COALESCE(kept.location_lng, d.location_lng),
+             default_patient = COALESCE(kept.default_patient, d.default_patient)
+           FROM contacts d WHERE kept.wa_id = $1 AND d.wa_id = $2`, [canon, r.wa_id]);
+      }
+      for (const t of childTables) {
+        await pool.query(`UPDATE ${t} SET wa_id = $1 WHERE wa_id = $2`, [canon, r.wa_id]).catch(() => {});
+      }
+      await pool.query(`DELETE FROM contacts WHERE wa_id = $1`, [r.wa_id]);
+      if (dup) merged++; else updated++;
+    } catch (e) { errors.push(`${r.wa_id}: ${e.message}`); }
+  }
+  return { total: rows.length, updated, merged, skipped, errors };
+}
+
 // Manually create/update a customer record (walk-in / phone). Keyed by phone.
 export async function createCustomer({ phone, name, address, note }) {
-  const waId = String(phone || "").replace(/\D/g, "");
+  const waId = normPhone(phone);
   if (!waId) throw new Error("phone required");
   await upsertContact(waId, name);
   await updateContact(waId, { name, address, note });
@@ -327,7 +410,7 @@ export async function getConversation(waId) {
   if (pool) {
     const { rows: cs } = await pool.query(
       `SELECT wa_id, name, booked, human_control, spam, note, address, needs_human,
-              name_confirmed, location_lat, location_lng, non_order_count,
+              name_confirmed, location_lat, location_lng, non_order_count, default_patient,
               EXTRACT(EPOCH FROM mukcare_paused_until)*1000 AS mukcare_paused_until
        FROM contacts WHERE wa_id = $1`,
       [waId]
@@ -343,13 +426,14 @@ export async function getConversation(waId) {
       waId: c.wa_id, name: c.name || c.wa_id,
       booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "", needsHuman: c.needs_human,
       nameConfirmed: c.name_confirmed, locationLat: c.location_lat, locationLng: c.location_lng, nonOrderCount: c.non_order_count || 0,
+      defaultPatient: c.default_patient || null,
       pausedUntil: c.mukcare_paused_until ? Number(c.mukcare_paused_until) : null,
       messages: ms.map(m => ({ dir: m.dir, type: m.type, text: m.body, ts: Number(m.ts), status: m.status, bot: m.bot, mediaId: m.media_id }))
     };
   }
   const c = mem.contacts[waId];
   if (!c) return null;
-  return { waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "", needsHuman: c.needs_human, nameConfirmed: c.name_confirmed, locationLat: c.location_lat, locationLng: c.location_lng, nonOrderCount: c.non_order_count || 0, pausedUntil: c.mukcare_paused_until || null, messages: c.messages };
+  return { waId: c.wa_id, name: c.name, booked: c.booked, humanControl: c.human_control, spam: c.spam, note: c.note || "", address: c.address || "", needsHuman: c.needs_human, nameConfirmed: c.name_confirmed, locationLat: c.location_lat, locationLng: c.location_lng, nonOrderCount: c.non_order_count || 0, defaultPatient: c.default_patient || null, pausedUntil: c.mukcare_paused_until || null, messages: c.messages };
 }
 
 // ---- Media (prescription images/documents) ----

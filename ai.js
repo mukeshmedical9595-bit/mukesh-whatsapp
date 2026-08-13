@@ -191,11 +191,15 @@ function buildSystemPrompt({ contact, store, settings, now }) {
   const custAddress = contact?.address && String(contact.address).trim() !== "" ? String(contact.address).trim() : null;
   const hasGps = contact?.locationLat != null && contact?.locationLng != null;
   const paymentConfigured = Boolean(settings?.paymentConfigured);
+  const defaultPatient = contact?.defaultPatient && String(contact.defaultPatient).trim() !== "" ? String(contact.defaultPatient).trim() : null;
+  const activeOrder = contact?.activeOrder || null; // { order_code, items } - order still being prepared
+  const lastOrder = contact?.lastOrder || null;     // { order_code, status } - most recent order
 
   let detailsBlock;
-  if (custName || custAddress) {
+  if (custName || custAddress || defaultPatient) {
     const lines = [];
     if (custName) lines.push(`- Name: ${custName}`);
+    if (defaultPatient) lines.push(`- Patient on file (from a previous order): ${defaultPatient}`);
     if (custAddress) lines.push(`- Saved delivery ${hasGps ? "location (GPS pin on file)" : "address (typed text, no GPS pin)"}: ${custAddress}`);
     // Repeat-customer location, three cases:
     let addrRule;
@@ -214,6 +218,19 @@ function buildSystemPrompt({ contact, store, settings, now }) {
   // starts passing a delivery-fee line on the store object. Not part of the
   // required interface, so it's fine if it's undefined.
   const deliveryFeeLine = store?.deliveryFeeText || null;
+
+  // §3d / §3e: surface the customer's in-progress and most-recent orders so the AI
+  // adds to an existing order instead of duplicating, and handles post-billing correctly.
+  let orderContextBlock = "";
+  if (activeOrder) {
+    const its = Array.isArray(activeOrder.items)
+      ? activeOrder.items.map(i => (i.name || "") + (i.qty && i.qty !== "1" ? " - " + i.qty : "")).filter(Boolean).join(", ")
+      : "";
+    orderContextBlock += `\n=== ORDER ALREADY IN PROGRESS ===\nThis customer has an order (${activeOrder.order_code}) that is being prepared and is NOT yet billed. Items so far: ${its || "(none listed)"}.\nIf the customer now mentions MORE or OTHER medicines, they are ADDING to THIS order - do NOT start a new order and do NOT re-ask patient name or pickup/delivery. Acknowledge warmly (e.g. "Noted 🙏 I've added these to your order ${activeOrder.order_code}") and set order.readbackConfirmed:true with the FULL updated item list. Only open a separate order if the customer clearly says it's a different/new order.\n`;
+  }
+  if (lastOrder && (lastOrder.status === "billed_ready" || lastOrder.status === "billed_dispatched")) {
+    orderContextBlock += `\n=== LATEST ORDER ALREADY BILLED ===\nThe customer's latest order (${lastOrder.order_code}) is already billed/${lastOrder.status === "billed_dispatched" ? "dispatched" : "ready"}.\n- If the customer simply acknowledges (ok, thanks, 👍, 🙏), reply with a short thank-you only - do NOT greet again or start a new order.\n- If they ask for MORE or OTHER medicines, FIRST ask whether they want to place a NEW order. If yes, take a fresh order (a new Order ID; patient on file still applies). If instead they want to change/add to the already-billed order, tell them the team will check and update, and set needsHuman:true.\n`;
+  }
 
   return `You are MUKCARE, the smart, warm, and polite WhatsApp receptionist for ${storeName}, an Indian pharmacy. You are concise and friendly - never robotic, never verbose.
 
@@ -238,10 +255,10 @@ Set the "lang" field to "en", "hi", or "te" for the language you actually used.
 
 === CUSTOMER DETAILS ON FILE ===
 ${detailsBlock}
-
+${orderContextBlock}
 === ORDER FLOW (guide the customer through this, one step at a time, do not dump every question at once) ===
 1. If it's a general enquiry (stock, timing, location, etc.), just help - no need to force the order flow.
-2. If the customer wants to order: ONLY ask for the patient's name if we do NOT already have it on file (see CUSTOMER DETAILS ON FILE above). If we have it, use it and move on. When the customer gives a name (or a different patient's name), set the "patientName" field in your JSON to exactly that name. The phone number is captured automatically - never ask for it.
+2. If the customer wants to order: ONLY ask for the patient's name if we do NOT already have it on file (see CUSTOMER DETAILS ON FILE above). If a "Patient on file" is listed, do NOT ask who the medicines are for - assume it is for that patient and go straight to the order; only ask if the customer says it is for someone else. Always CONFIRM the patient name inside the final order read-back so they can correct it. When the customer gives a name (or a different patient's name), set the "patientName" field in your JSON to exactly that name. The phone number is captured automatically - never ask for it.
 3. Ask how they'd like to order: type out the medicines, OR send a photo (either their doctor's prescription, or a clear photo of the medicine/product they want).
 4. If typed: ask them to send each item as "Product name - Quantity" (example: "DOLO 650 - 3 strips"), and record every item they mention into "order.items".
 5. If the customer sends a PHOTO, follow the "PHOTOS THE CUSTOMER SENDS" rules below.

@@ -2,9 +2,9 @@
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
-import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, setMukcarePause, updateContact, getSetting, setSetting, getSettings, bumpNonOrderCount, saveMedia, getMedia, listContacts, createCustomer, deleteContact, getLatestImageMediaId, dbEnabled } from "./db.js";
+import { initDb, addMessage, updateStatus, getConversations, getConversation, setContactFlag, setMukcarePause, updateContact, getSetting, setSetting, getSettings, bumpNonOrderCount, saveMedia, getMedia, listContacts, createCustomer, deleteContact, getLatestImageMediaId, getContactByWa, normalizeAllNumbers, dbEnabled } from "./db.js";
 import { mukcareReply, classifyFeedback } from "./ai.js";
-import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, deleteOrder, createExec, listExecs, setExecActive, execHandoffMessage, getEvents, getOrderItems, setOrderItems, logEvent, setOrderBilling, getProcurement, lockProcurement, editProcurementVendor, deleteProcurementLine, addFeedback, listFeedback, feedbackCounts, markFeedbackHandled, ordersNeedingFeedbackRequest, markFeedbackRequested, normalizeProductName } from "./orders.js";
+import { initOrders, createOrder, listOrders, getOrder, updateOrderStatus, assignExec, reissueOrder, deleteOrder, createExec, listExecs, setExecActive, execHandoffMessage, getEvents, getOrderItems, setOrderItems, logEvent, setOrderBilling, getProcurement, lockProcurement, editProcurementVendor, deleteProcurementLine, addFeedback, listFeedback, feedbackCounts, markFeedbackHandled, ordersNeedingFeedbackRequest, markFeedbackRequested, normalizeProductName, addItems, latestActiveUnbilled } from "./orders.js";
 import { sendTemplate, sendOrderReady, sendOrderDispatched, sendOrderReminder, sendBillSent, sendDeliveryAssignment } from "./templates.js";
 import { initCampaignsDb, sendCampaign, recordOptOut } from "./campaigns.js";
 import crypto from "crypto";
@@ -436,8 +436,20 @@ async function handleAiReply(waId) {
       } catch (e) { console.error("load image for AI err", e); }
     }
 
+    // §3d/§3e: give the AI the customer's in-progress and most-recent orders.
+    let activeOrder = null, lastOrder = null;
+    try {
+      activeOrder = await latestActiveUnbilled(waId);
+      const recent = await listOrders({ waId, limit: 1 });
+      if (recent && recent[0]) lastOrder = { order_code: recent[0].order_code, status: recent[0].status };
+    } catch (e) { console.error("order context err", e); }
+
     const result = await mukcareReply({
-      contact: { ...convo, messages: convo.messages },
+      contact: {
+        ...convo, messages: convo.messages,
+        activeOrder: activeOrder ? { order_code: activeOrder.order_code, items: activeOrder.items } : null,
+        lastOrder
+      },
       messages: convo.messages,
       settings: { trainInstructions, paymentConfigured },
       store: AI_STORE,
@@ -447,10 +459,11 @@ async function handleAiReply(waId) {
     if (result.error) { console.error("MUKCARE error:", result.error); return; }
 
     // Save the patient's name (as given by the customer in chat) as the display name,
-    // and mark it confirmed so KYC is skipped on future chats.
+    // mark it confirmed, and remember it as the default patient so future orders skip the ask.
     if (result.patientName) {
-      await updateContact(waId, { name: result.patientName, nameConfirmed: true });
+      await updateContact(waId, { name: result.patientName, nameConfirmed: true, defaultPatient: result.patientName });
       convo.name = result.patientName;
+      convo.defaultPatient = result.patientName;
     }
 
     // Spam guard: count consecutive non-order messages; auto-flag as spam past a
@@ -487,24 +500,36 @@ async function handleAiReply(waId) {
     // When the customer confirms the order, record it and send the real Order ID.
     if (result.order) {
       try {
-        // Prefer a saved location (e.g. a shared Maps link) over a vague AI phrase.
-        const deliveryAddress = convo.address || result.order.location;
-        // Remember the address on the customer's record for next time (only if we don't already have one).
-        if (result.order.fulfillment === "delivery" && result.order.location && !convo.address) {
-          await updateContact(waId, { address: result.order.location });
+        // §3d: if an un-billed order is already being prepared, APPEND to it instead
+        // of opening a duplicate (unless the AI explicitly flagged this as a new order).
+        if (activeOrder && !result.order.newOrder) {
+          await addItems(activeOrder.id, result.order.items);
+          console.log(`ORDER items added to ${activeOrder.order_code} for ${waId}`);
+        } else {
+          // §3f: never let a confirmed delivery order silently degrade to pickup.
+          // If the AI omitted fulfillment, infer delivery from a shared location / saved pin.
+          const fulfillment = result.order.fulfillment
+            || ((result.order.location || convo.locationLat != null) ? "delivery" : "pickup");
+          // Prefer a saved location (e.g. a shared Maps link) over a vague AI phrase.
+          const deliveryAddress = convo.address || result.order.location;
+          // Remember the address on the customer's record for next time (only if we don't already have one).
+          if (fulfillment === "delivery" && result.order.location && !convo.address) {
+            await updateContact(waId, { address: result.order.location });
+          }
+          const order = await createOrder({
+            waId,
+            customerName: convo.name,
+            phone: waId,
+            mode: result.order.mode,
+            items: result.order.items,
+            fulfillment,
+            address: fulfillment === "delivery" ? deliveryAddress : null,
+            patientName: convo.defaultPatient || convo.name || null,
+            status: "new"
+          });
+          await sendWhatsAppText(waId, `Your Order ID is ${order.order_code}. Please keep it for reference. 🙏`, { bot: true });
+          console.log(`ORDER created ${order.order_code} for ${waId}`);
         }
-        const order = await createOrder({
-          waId,
-          customerName: convo.name,
-          phone: waId,
-          mode: result.order.mode,
-          items: result.order.items,
-          fulfillment: result.order.fulfillment,
-          address: result.order.fulfillment === "delivery" ? deliveryAddress : null,
-          status: "new"
-        });
-        await sendWhatsAppText(waId, `Your Order ID is ${order.order_code}. Please keep it for reference. 🙏`, { bot: true });
-        console.log(`ORDER created ${order.order_code} for ${waId}`);
       } catch (oe) { console.error("createOrder err", oe); }
     }
   } catch (e) { console.error("handleAiReply err", e); }
@@ -947,6 +972,16 @@ app.post("/api/customers/:waId", requireAuth, async (req, res) => {
   const { name, address, note } = req.body || {};
   try { await updateContact(req.params.waId, { name, address, note }); res.json({ ok: true }); }
   catch (err) { console.error("customer edit err", err); res.status(500).json({ error: String(err) }); }
+});
+// §4/§5: look up a saved customer by number (any format) to auto-fill the manual order form.
+app.get("/api/customers/by-number/:wa", requireAuth, async (req, res) => {
+  try { res.json({ customer: await getContactByWa(req.params.wa) }); }
+  catch (err) { console.error("customer by-number err", err); res.status(500).json({ error: String(err) }); }
+});
+// §5: one-time migration - rewrite every stored number to 91XXXXXXXXXX and merge duplicates.
+app.post("/api/customers/normalize", requireAuth, async (req, res) => {
+  try { res.json({ ok: true, result: await normalizeAllNumbers() }); }
+  catch (err) { console.error("normalizeAllNumbers err", err); res.status(500).json({ error: String(err) }); }
 });
 
 // ---- Retail import of existing customers (Name | Mobile | Alternate | Location) ----
