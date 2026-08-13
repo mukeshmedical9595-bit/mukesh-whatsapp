@@ -387,13 +387,26 @@ async function notifyOrderStatus(order) {
 }
 
 // Dispatch notifications: fired when a delivery executive is assigned to a
-// billed_dispatched order. Messages the customer AND the delivery executive.
+// billed_dispatched order. §7: the customer receives ONLY the delivery agent's
+// name + phone (the invoice was already sent at billing - do NOT re-send it).
+// The assigned executive receives the full delivery details.
 async function notifyDispatch(order) {
   try {
-    await notifyCustomer(order, "dispatched");
-    if (order.exec_id) {
-      const exec = (await listExecs()).find(e => String(e.id) === String(order.exec_id));
-      const execPhone = normalizePhone(exec?.phone);
+    const exec = order.exec_id ? (await listExecs()).find(e => String(e.id) === String(order.exec_id)) : null;
+    // Customer: share only the delivery agent's details.
+    const to = normalizePhone(order.wa_id || order.phone);
+    if (to) {
+      const name = order.customer_name || "there", code = order.order_code || "";
+      const agentName = exec?.name || "Our delivery agent";
+      const agentPhone = normalizePhone(exec?.phone);
+      const msg = agentPhone
+        ? `Hi ${name}, your order ${code} is out for delivery. ${agentName} (${agentPhone}) will reach you shortly. Thank you! 🙏`
+        : `Hi ${name}, your order ${code} is out for delivery. Our delivery agent will reach you shortly. Thank you! 🙏`;
+      await sendWhatsAppText(to, msg, { bot: true }).catch(() => {});
+    }
+    // Executive: full delivery details (approved template first, rich text fallback).
+    if (exec) {
+      const execPhone = normalizePhone(exec.phone);
       if (execPhone) {
         const items = (Array.isArray(order.items) ? order.items : []).map(it => it.name + (it.qty ? (" - " + it.qty) : "")).join(", ") || (order.mode === "prescription" ? "Prescription order" : "-");
         let r = null;
@@ -802,8 +815,8 @@ app.post("/api/orders/:id/bill", requireAuth, async (req, res) => {
     if (to) {
       const name = order.customer_name || "there", code = order.order_code || "";
       const msg = isDelivery
-        ? `Hi ${name}, your order ${code} is billed and ready for dispatch. Our delivery agent's details will follow shortly. Thank you! 🙏`
-        : `Hi ${name}, your order ${code} is billed and ready for pickup at Mukesh Medical. Thank you! 🙏`;
+        ? `Hi ${name}, your order ${code} is ready. Here is your invoice, please check. 🙏 Our delivery agent's details will be shared with you shortly.`
+        : `Hi ${name}, your order ${code} is billed and ready for pickup at Mukesh Medical. Here is your invoice, please check. Thank you! 🙏`;
       await sendWhatsAppText(to, msg, { bot: true }).catch(() => {});
       if (billMediaId) await sendWhatsAppDocument(to, { link: mediaLink(billMediaId), filename: `Invoice-${code}.pdf`, caption: `Invoice ${code}` }, { bot: true }).catch(() => {});
     }
@@ -916,8 +929,8 @@ app.post("/api/bridge/results", async (req, res) => {
       if (to) {
         const name = order.customer_name || "there", code = order.order_code;
         const msg = isDelivery
-          ? `Hi ${name}, your order ${code} is billed and ready for dispatch. Our delivery agent's details will follow shortly. Thank you! 🙏`
-          : `Hi ${name}, your order ${code} is billed and ready for pickup at Mukesh Medical. Thank you! 🙏`;
+          ? `Hi ${name}, your order ${code} is ready. Here is your invoice, please check. 🙏 Our delivery agent's details will be shared with you shortly.`
+          : `Hi ${name}, your order ${code} is billed and ready for pickup at Mukesh Medical. Here is your invoice, please check. Thank you! 🙏`;
         await sendWhatsAppText(to, msg, { bot: true }).catch(() => {});
         if (billMediaId) await sendWhatsAppDocument(to, { link: mediaLink(billMediaId), filename: `Invoice-${code}.pdf`, caption: `Invoice ${code}` }, { bot: true }).catch(() => {});
       }
